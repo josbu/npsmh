@@ -2,19 +2,24 @@ package version
 
 import "fmt"
 
-const VERSION = "0.34.8"
+const VERSION = "0.35.0"
 const MinVer = 7
 
-var MinVersions = []string{
-	"0.26.0", // 0
-	"0.27.0", // 1
-	"0.28.0", // 2
-	"0.29.0", // 3
-	"0.30.0", // 4
-	"0.31.0", // 5
-	"0.32.0", // 6
-	"0.33.0", // 7
-	"0.34.0", // 8
+var MinVersions = defaultMinVersions()
+
+func defaultMinVersions() []string {
+	return []string{
+		"0.26.0", // 0
+		"0.27.0", // 1
+		"0.28.0", // 2
+		"0.29.0", // 3
+		"0.30.0", // 4
+		"0.31.0", // 5
+		"0.32.0", // 6
+		"0.33.0", // 7
+		"0.34.0", // 8
+		VERSION,  // 9
+	}
 }
 
 func GetVersion(index int) string {

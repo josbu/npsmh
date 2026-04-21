@@ -20,6 +20,12 @@ func TestGetVersion(t *testing.T) {
 	}
 }
 
+func TestVersionConstantMatchesLatestSupportedVersion(t *testing.T) {
+	if got := GetLatest(); got != VERSION {
+		t.Fatalf("GetLatest() = %q, want VERSION %q", got, VERSION)
+	}
+}
+
 func TestVersionRangeHelpers(t *testing.T) {
 	if got := GetCount(); got != len(MinVersions) {
 		t.Fatalf("GetCount() = %d, want %d", got, len(MinVersions))
