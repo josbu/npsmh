@@ -7,6 +7,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -78,6 +79,66 @@ func TestCertManagerFileNotFoundAndIdleEviction(t *testing.T) {
 	}
 	if mutexExists {
 		t.Fatal("expected evict-me load mutex to be removed")
+	}
+}
+
+func TestCertManagerFailedInitialLoadReleasesLoadMutex(t *testing.T) {
+	m := NewCertManager(10, 0, 0)
+	defer m.Stop()
+
+	tmpDir := t.TempDir()
+	certPath := filepath.Join(tmpDir, "missing-cert.pem")
+	keyPath := filepath.Join(tmpDir, "missing-key.pem")
+	if _, err := m.Get(certPath, keyPath, "file", "missing-lock"); err == nil {
+		t.Fatal("expected missing certificate files to return error")
+	}
+
+	m.mu.Lock()
+	_, exists := m.loadMutexes["missing-lock"]
+	m.mu.Unlock()
+	if exists {
+		t.Fatal("expected failed initial load to release its load mutex")
+	}
+}
+
+func TestCertManagerExpiredFileReloadFailureReturnsError(t *testing.T) {
+	m := NewCertManager(10, 0, 0)
+	defer m.Stop()
+
+	certPEM, keyPEM := generateTestPEM(t)
+	tmpDir := t.TempDir()
+	certPath := filepath.Join(tmpDir, "cert.pem")
+	keyPath := filepath.Join(tmpDir, "key.pem")
+	if err := os.WriteFile(certPath, []byte(certPEM), 0o600); err != nil {
+		t.Fatalf("write cert failed: %v", err)
+	}
+	if err := os.WriteFile(keyPath, []byte(keyPEM), 0o600); err != nil {
+		t.Fatalf("write key failed: %v", err)
+	}
+
+	first, err := m.Get(certPath, keyPath, "file", "expired-reload")
+	if err != nil {
+		t.Fatalf("initial get failed: %v", err)
+	}
+	if first == nil {
+		t.Fatal("initial get returned nil certificate")
+	}
+
+	m.mu.Lock()
+	if elem, ok := m.cache.Get("expired-reload"); ok {
+		elem.(*certEntry).expire = time.Now().Add(-time.Second)
+	}
+	m.mu.Unlock()
+
+	if err := os.Remove(certPath); err != nil {
+		t.Fatalf("remove cert failed: %v", err)
+	}
+	if err := os.Remove(keyPath); err != nil {
+		t.Fatalf("remove key failed: %v", err)
+	}
+
+	if _, err := m.Get(certPath, keyPath, "file", "expired-reload"); err == nil {
+		t.Fatal("expected expired cached certificate reload failure to return error")
 	}
 }
 

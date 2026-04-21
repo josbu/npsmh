@@ -2,7 +2,6 @@ package cache
 
 import (
 	"bytes"
-	"container/list"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -94,6 +93,14 @@ func (m *CertManager) getLoadMutex(key string) *sync.Mutex {
 	return lm
 }
 
+func (m *CertManager) deleteLoadMutex(key string, current *sync.Mutex) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if existing, ok := m.loadMutexes[key]; ok && existing == current {
+		delete(m.loadMutexes, key)
+	}
+}
+
 func (m *CertManager) Get(certInput, keyInput, mode, hash string) (*tls.Certificate, error) {
 	now := time.Now()
 	var isFile bool
@@ -123,10 +130,17 @@ func (m *CertManager) Get(certInput, keyInput, mode, hash string) (*tls.Certific
 			lm.Lock()
 			newCert, err := tls.LoadX509KeyPair(certFile, keyFile)
 			newExpire, err2 := parseExpire(&newCert)
+			reloadErr := err
+			if reloadErr == nil {
+				reloadErr = err2
+			}
+			if reloadErr == nil && !newExpire.After(now) {
+				reloadErr = errors.New("certificate expired")
+			}
 
 			m.mu.Lock()
 			e.lastReload = now
-			if err == nil && err2 == nil {
+			if reloadErr == nil {
 				if expired || !bytes.Equal(newCert.Certificate[0], cached.Certificate[0]) {
 					e.cert = &newCert
 					e.expire = newExpire
@@ -135,6 +149,9 @@ func (m *CertManager) Get(certInput, keyInput, mode, hash string) (*tls.Certific
 			}
 			m.mu.Unlock()
 			lm.Unlock()
+			if reloadErr != nil && expired {
+				return nil, reloadErr
+			}
 		}
 		return cached, nil
 	}
@@ -161,9 +178,11 @@ func (m *CertManager) Get(certInput, keyInput, mode, hash string) (*tls.Certific
 		certPath := common.GetPath(certInput)
 		keyPath := common.GetPath(keyInput)
 		if _, err1 := os.Stat(certPath); err1 != nil {
+			m.deleteLoadMutex(hash, lm)
 			return nil, errors.New("cert file not found")
 		}
 		if _, err2 := os.Stat(keyPath); err2 != nil {
+			m.deleteLoadMutex(hash, lm)
 			return nil, errors.New("key file not found")
 		}
 		cert, err = tls.LoadX509KeyPair(certPath, keyPath)
@@ -171,11 +190,13 @@ func (m *CertManager) Get(certInput, keyInput, mode, hash string) (*tls.Certific
 		cert, err = tls.X509KeyPair([]byte(certInput), []byte(keyInput))
 	}
 	if err != nil {
+		m.deleteLoadMutex(hash, lm)
 		return nil, err
 	}
 
 	expire, err := parseExpire(&cert)
 	if err != nil {
+		m.deleteLoadMutex(hash, lm)
 		return nil, err
 	}
 
@@ -203,16 +224,15 @@ func (m *CertManager) evictIdle() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	m.cache.cache.Range(func(k, v interface{}) bool {
-		key := k.(Key)
-		elem := v.(*list.Element)
+	m.cache.mu.Lock()
+	defer m.cache.mu.Unlock()
+	for key, elem := range m.cache.cache {
 		e := elem.Value.(*entry).value.(*certEntry)
 		if e.lastUsed.Before(cutoff) {
-			m.cache.Remove(key)
+			m.cache.removeElementLocked(elem)
 			if hs, ok := key.(string); ok {
 				delete(m.loadMutexes, hs)
 			}
 		}
-		return true
-	})
+	}
 }

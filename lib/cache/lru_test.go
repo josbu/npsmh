@@ -57,6 +57,26 @@ func TestCacheRemoveAndClearCallOnEvicted(t *testing.T) {
 	}
 }
 
+func TestCacheClearLeavesCacheReusable(t *testing.T) {
+	c := New(2)
+	c.Add("a", 1)
+	c.Add("b", 2)
+
+	c.Clear()
+
+	if c.Len() != 0 {
+		t.Fatalf("expected cache len 0 after clear, got %d", c.Len())
+	}
+	if _, ok := c.Get("a"); ok {
+		t.Fatal("expected cleared key a to be absent")
+	}
+
+	c.Add("c", 3)
+	if got, ok := c.Get("c"); !ok || got.(int) != 3 {
+		t.Fatalf("expected cache to remain reusable after clear, got %v ok=%v", got, ok)
+	}
+}
+
 func contains(items []string, target string) bool {
 	for _, item := range items {
 		if item == target {
