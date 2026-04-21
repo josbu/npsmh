@@ -95,6 +95,26 @@ func TestConcurrentMixedOps(t *testing.T) {
 	}
 }
 
+func TestRemoveClearsRetainedPointerSlot(t *testing.T) {
+	pl := New[*int]()
+	value := new(int)
+	*value = 42
+
+	pl.Push(value)
+	pl.Remove(value)
+
+	if pl.Size() != 0 {
+		t.Fatalf("Size() = %d, want 0", pl.Size())
+	}
+	if cap(pl.list) == 0 {
+		t.Fatal("expected backing array capacity to remain for retention check")
+	}
+	full := pl.list[:cap(pl.list)]
+	if full[0] != nil {
+		t.Fatal("removed pointer should not remain referenced in the backing array")
+	}
+}
+
 func TestRandomEnqueueDequeueOrderRatio(t *testing.T) {
 	skipIfLongRunning(t)
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))

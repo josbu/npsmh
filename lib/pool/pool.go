@@ -1,13 +1,13 @@
 package pool
 
 import (
-	"math/rand"
 	"sync"
 	"sync/atomic"
 )
 
 type Pool[T comparable] struct {
 	rr   atomic.Uint64
+	rnd  atomic.Uint64
 	head uint64
 	mu   sync.RWMutex
 	list []T
@@ -133,7 +133,8 @@ func (p *Pool[T]) Next() (v T, ok bool) { // Round-Robin
 func (p *Pool[T]) Random() (v T, ok bool) {
 	p.mu.RLock()
 	if n := len(p.list); n > 0 {
-		v, ok = p.list[rand.Intn(n)], true
+		i := mixUint64(p.rnd.Add(0x9e3779b97f4a7c15))
+		v, ok = p.list[i%uint64(n)], true
 	}
 	p.mu.RUnlock()
 	return
@@ -189,6 +190,8 @@ func (p *Pool[T]) removeAt(i int) {
 		p.list[i] = p.list[last]
 		p.idx[p.list[i]] = i
 	}
+	var zero T
+	p.list[last] = zero
 	p.list = p.list[:last]
 	delete(p.idx, v)
 
@@ -207,4 +210,12 @@ func (p *Pool[T]) removeAt(i int) {
 
 func init() {
 	//rand.Seed(time.Now().UnixNano())
+}
+
+func mixUint64(x uint64) uint64 {
+	x ^= x >> 30
+	x *= 0xbf58476d1ce4e5b9
+	x ^= x >> 27
+	x *= 0x94d049bb133111eb
+	return x ^ (x >> 31)
 }
