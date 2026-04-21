@@ -2,6 +2,10 @@ package index
 
 import "sync"
 
+type idleConnectionCloser interface {
+	CloseIdleConnections()
+}
+
 type StringIDIndex struct {
 	mu   sync.RWMutex
 	data map[string]int
@@ -42,7 +46,7 @@ func (idx *StringIDIndex) Remove(key string) {
 
 func (idx *StringIDIndex) Clear() {
 	idx.mu.Lock()
-	idx.data = make(map[string]int)
+	clear(idx.data)
 	idx.mu.Unlock()
 }
 
@@ -86,7 +90,7 @@ func (idx *StringIndex) Remove(key string) {
 
 func (idx *StringIndex) Clear() {
 	idx.mu.Lock()
-	idx.data = make(map[string]string)
+	clear(idx.data)
 	idx.mu.Unlock()
 }
 
@@ -111,10 +115,7 @@ func (idx *AnyStringIndex) Remove(key string) {
 }
 
 func (idx *AnyStringIndex) Clear() {
-	idx.data.Range(func(k, _ interface{}) bool {
-		idx.data.Delete(k)
-		return true
-	})
+	idx.data.Clear()
 }
 
 type AnyIntIndex struct {
@@ -129,17 +130,58 @@ func (idx *AnyIntIndex) Add(key int, value interface{}) {
 	idx.data.Store(key, value)
 }
 
+func (idx *AnyIntIndex) LoadOrStore(key int, value interface{}) (actual interface{}, loaded bool) {
+	return idx.data.LoadOrStore(key, value)
+}
+
+func (idx *AnyIntIndex) CompareAndDelete(key int, expected interface{}) bool {
+	if idx == nil {
+		return false
+	}
+	return idx.data.CompareAndDelete(key, expected)
+}
+
 func (idx *AnyIntIndex) Get(key int) (value interface{}, ok bool) {
 	return idx.data.Load(key)
 }
 
 func (idx *AnyIntIndex) Remove(key int) {
-	idx.data.Delete(key)
+	if idx == nil {
+		return
+	}
+	if value, ok := idx.data.LoadAndDelete(key); ok {
+		if closer, ok := value.(idleConnectionCloser); ok {
+			closer.CloseIdleConnections()
+		}
+	}
+}
+
+func (idx *AnyIntIndex) Range(fn func(int, interface{}) bool) {
+	if idx == nil || fn == nil {
+		return
+	}
+	idx.data.Range(func(key, value interface{}) bool {
+		intKey, ok := key.(int)
+		if !ok {
+			return true
+		}
+		return fn(intKey, value)
+	})
 }
 
 func (idx *AnyIntIndex) Clear() {
-	idx.data.Range(func(k, _ interface{}) bool {
-		idx.data.Delete(k)
+	if idx == nil {
+		return
+	}
+	closers := make([]idleConnectionCloser, 0)
+	idx.data.Range(func(_, value interface{}) bool {
+		if closer, ok := value.(idleConnectionCloser); ok {
+			closers = append(closers, closer)
+		}
 		return true
 	})
+	idx.data.Clear()
+	for _, closer := range closers {
+		closer.CloseIdleConnections()
+	}
 }

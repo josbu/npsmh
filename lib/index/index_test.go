@@ -3,8 +3,17 @@ package index
 import (
 	"reflect"
 	"sort"
+	"sync/atomic"
 	"testing"
 )
+
+type testIdleCloser struct {
+	closed atomic.Int32
+}
+
+func (c *testIdleCloser) CloseIdleConnections() {
+	c.closed.Add(1)
+}
 
 func sortedInts(values []int) []int {
 	out := append([]int(nil), values...)
@@ -73,6 +82,26 @@ func TestAnyIndexes_Clear(t *testing.T) {
 	intIdx.Clear()
 	if _, ok := intIdx.Get(7); ok {
 		t.Fatalf("expected int key 7 to be cleared")
+	}
+}
+
+func TestAnyIntIndexClearClosesIdleConnections(t *testing.T) {
+	idx := NewAnyIntIndex()
+	first := &testIdleCloser{}
+	second := &testIdleCloser{}
+	idx.Add(1, first)
+	idx.Add(2, second)
+
+	idx.Clear()
+
+	if first.closed.Load() != 1 || second.closed.Load() != 1 {
+		t.Fatalf("expected idle connections to be closed once, got first=%d second=%d", first.closed.Load(), second.closed.Load())
+	}
+	if _, ok := idx.Get(1); ok {
+		t.Fatal("expected key 1 to be removed after Clear")
+	}
+	if _, ok := idx.Get(2); ok {
+		t.Fatal("expected key 2 to be removed after Clear")
 	}
 }
 
