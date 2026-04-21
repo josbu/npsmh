@@ -6,9 +6,9 @@ import (
 )
 
 func TestParseProxyACLEntries(t *testing.T) {
-	raw := "\n # comment\n;comment2\nEXAMPLE.com\n10.0.0.0/8\n[2001:db8::1]:443\n中文：8080\n"
+	raw := "\n # comment\n;comment2\nEXAMPLE.com\n10.0.0.0/8\n[2001:db8::1]:443\nservice：8080\n"
 	got := ParseProxyACLEntries(raw)
-	want := []string{"example.com", "10.0.0.0/8", "[2001:db8::1]:443", "中文:8080"}
+	want := []string{"example.com", "10.0.0.0/8", "[2001:db8::1]:443", "service:8080"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("ParseProxyACLEntries() = %#v, want %#v", got, want)
 	}

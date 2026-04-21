@@ -22,6 +22,11 @@ import (
 const defaultPortMappingLeaseSeconds = 3600
 
 const (
+	defaultPortMappingAttemptTimeout = 1200 * time.Millisecond
+	defaultNATPMPTimeout             = 750 * time.Millisecond
+)
+
+const (
 	pcpVersion        = 2
 	pcpDefaultPort    = 5351
 	pcpDefaultTimeout = 2 * time.Second
@@ -66,59 +71,60 @@ type managedPacketConn struct {
 }
 
 func (c *managedPacketConn) Close() error {
-	err := c.PacketConn.Close()
+	if c == nil || c.PacketConn == nil {
+		return nil
+	}
 	c.closeOnce.Do(func() {
 		if c.cancelRenew != nil {
 			c.cancelRenew()
 		}
 		if c.cleanup != nil {
-			_ = c.cleanup()
+			go func(cleanup func() error) {
+				_ = cleanup()
+			}(c.cleanup)
 		}
 	})
-	return err
+	return c.PacketConn.Close()
 }
 
-func maybeEnablePortMapping(ctx context.Context, packetConn net.PacketConn, probe P2PProbeConfig) (net.PacketConn, *PortMappingInfo) {
-	if packetConn == nil {
+func maybeEnablePortMapping(ctx context.Context, packetConn net.PacketConn, probe P2PProbeConfig, observation NatObservation) (net.PacketConn, *PortMappingInfo) {
+	coordinator := newPortMappingCoordinator(packetConn, probe, observation)
+	if coordinator == nil {
 		return nil, nil
 	}
-	enableUPnP, _ := parseProbeBoolOption(probe.Options, "enable_upnp_portmap")
-	enablePCP, _ := parseProbeBoolOption(probe.Options, "enable_pcp_portmap")
-	enableNATPMP, _ := parseProbeBoolOption(probe.Options, "enable_natpmp_portmap")
-	if !enableUPnP && !enablePCP && !enableNATPMP {
-		return packetConn, nil
-	}
+	return coordinator.attempt(ctx)
+}
 
-	internalPort := common.GetPortByAddr(packetConn.LocalAddr().String())
-	internalIP := portMappingInternalIP(packetConn.LocalAddr())
-	if internalPort <= 0 || internalIP == "" {
-		return packetConn, nil
+func normalizePortMappingContext(ctx context.Context) context.Context {
+	if ctx != nil {
+		return ctx
 	}
+	return context.Background()
+}
 
-	leaseSeconds, ok := parseProbeIntOption(probe.Options, "portmap_lease_seconds")
-	if !ok || leaseSeconds <= 0 {
-		leaseSeconds = defaultPortMappingLeaseSeconds
+func shouldAttemptPortMapping(observation NatObservation) bool {
+	if observation.PortMapping != nil {
+		return false
 	}
-
-	if enableUPnP {
-		if info, cleanup, renew := tryUPnPPortMapping(ctx, internalIP, internalPort, leaseSeconds); info != nil {
-			logs.Info("[P2P] port mapping method=%s external=%s internal=%s lease=%ds", info.Method, info.ExternalAddr, info.InternalAddr, info.LeaseSeconds)
-			return wrapManagedPacketConn(packetConn, cleanup, renew, leaseSeconds), info
-		}
+	if observation.PublicIP == "" {
+		return true
 	}
-	if enablePCP {
-		if info, cleanup, renew := tryPCPPortMapping(ctx, internalIP, internalPort, leaseSeconds); info != nil {
-			logs.Info("[P2P] port mapping method=%s external=%s internal=%s lease=%ds", info.Method, info.ExternalAddr, info.InternalAddr, info.LeaseSeconds)
-			return wrapManagedPacketConn(packetConn, cleanup, renew, info.LeaseSeconds), info
-		}
+	if observation.ProbePortRestricted || observation.MappingConfidenceLow || !observation.FilteringTested {
+		return true
 	}
-	if enableNATPMP {
-		if info, cleanup, renew := tryNATPMPPortMapping(internalIP, internalPort, leaseSeconds); info != nil {
-			logs.Info("[P2P] port mapping method=%s external=%s internal=%s lease=%ds", info.Method, info.ExternalAddr, info.InternalAddr, info.LeaseSeconds)
-			return wrapManagedPacketConn(packetConn, cleanup, renew, leaseSeconds), info
-		}
+	switch observation.NATType {
+	case NATTypeUnknown, NATTypePortRestricted, NATTypeSymmetric:
+		return true
 	}
-	return packetConn, nil
+	switch observation.MappingBehavior {
+	case "", NATMappingUnknown, NATMappingEndpointDependent:
+		return true
+	}
+	switch observation.FilteringBehavior {
+	case "", NATFilteringUnknown, NATFilteringPortRestricted:
+		return true
+	}
+	return false
 }
 
 func wrapManagedPacketConn(packetConn net.PacketConn, cleanup func() error, renew func() error, leaseSeconds int) net.PacketConn {
@@ -192,6 +198,7 @@ func portMappingInternalIP(localAddr net.Addr) string {
 }
 
 func tryUPnPPortMapping(ctx context.Context, internalIP string, internalPort, leaseSeconds int) (*PortMappingInfo, func() error, func() error) {
+	ctx = normalizePortMappingContext(ctx)
 	if info, cleanup, renew := tryUPnPIGD2(ctx, internalIP, internalPort, leaseSeconds); info != nil {
 		return info, cleanup, renew
 	}
@@ -205,6 +212,7 @@ func tryUPnPPortMapping(ctx context.Context, internalIP string, internalPort, le
 }
 
 func tryUPnPIGD2(ctx context.Context, internalIP string, internalPort, leaseSeconds int) (*PortMappingInfo, func() error, func() error) {
+	ctx = normalizePortMappingContext(ctx)
 	clients, _, err := internetgateway2.NewWANIPConnection2ClientsCtx(ctx)
 	if err != nil {
 		logs.Trace("[P2P] upnp igd2 discovery failed: %v", err)
@@ -250,6 +258,7 @@ type upnpPortMapper interface {
 }
 
 func tryUPnPIGD1(ctx context.Context, internalIP string, internalPort, leaseSeconds int) (*PortMappingInfo, func() error, func() error) {
+	ctx = normalizePortMappingContext(ctx)
 	clients, _, err := internetgateway1.NewWANIPConnection1ClientsCtx(ctx)
 	if err != nil {
 		logs.Trace("[P2P] upnp igd1 discovery failed: %v", err)
@@ -259,6 +268,7 @@ func tryUPnPIGD1(ctx context.Context, internalIP string, internalPort, leaseSeco
 }
 
 func tryUPnPPPP1(ctx context.Context, internalIP string, internalPort, leaseSeconds int) (*PortMappingInfo, func() error, func() error) {
+	ctx = normalizePortMappingContext(ctx)
 	clients, _, err := internetgateway1.NewWANPPPConnection1ClientsCtx(ctx)
 	if err != nil {
 		logs.Trace("[P2P] upnp ppp discovery failed: %v", err)
@@ -268,6 +278,7 @@ func tryUPnPPPP1(ctx context.Context, internalIP string, internalPort, leaseSeco
 }
 
 func tryUPnPStaticPortMapping[T upnpPortMapper](ctx context.Context, method, internalIP string, internalPort, leaseSeconds int, clients []T) (*PortMappingInfo, func() error, func() error) {
+	ctx = normalizePortMappingContext(ctx)
 	for _, client := range clients {
 		externalIP, err := client.GetExternalIPAddressCtx(ctx)
 		if err != nil || externalIP == "" {
@@ -297,13 +308,14 @@ func tryUPnPStaticPortMapping[T upnpPortMapper](ctx context.Context, method, int
 	return nil, nil, nil
 }
 
-func tryNATPMPPortMapping(internalIP string, internalPort, leaseSeconds int) (*PortMappingInfo, func() error, func() error) {
+func tryNATPMPPortMapping(ctx context.Context, internalIP string, internalPort, leaseSeconds int) (*PortMappingInfo, func() error, func() error) {
+	ctx = normalizePortMappingContext(ctx)
 	gatewayIP, err := gateway.DiscoverGateway()
 	if err != nil || gatewayIP == nil {
 		logs.Trace("[P2P] nat-pmp gateway discovery failed: %v", err)
 		return nil, nil, nil
 	}
-	client := natpmp.NewClientWithTimeout(gatewayIP, 2*time.Second)
+	client := natpmp.NewClientWithTimeout(gatewayIP, portMappingRequestTimeout(ctx, defaultNATPMPTimeout))
 	externalAddress, err := client.GetExternalAddress()
 	if err != nil {
 		logs.Trace("[P2P] nat-pmp get external address failed: %v", err)
@@ -334,6 +346,7 @@ func tryNATPMPPortMapping(internalIP string, internalPort, leaseSeconds int) (*P
 }
 
 func tryPCPPortMapping(ctx context.Context, internalIP string, internalPort, leaseSeconds int) (*PortMappingInfo, func() error, func() error) {
+	ctx = normalizePortMappingContext(ctx)
 	gatewayIP, err := gateway.DiscoverGateway()
 	if err != nil || gatewayIP == nil {
 		logs.Trace("[P2P] pcp gateway discovery failed: %v", err)
@@ -387,10 +400,33 @@ func tryPCPPortMapping(ctx context.Context, internalIP string, internalPort, lea
 	return info, cleanup, renew
 }
 
+func portMappingRequestTimeout(ctx context.Context, fallback time.Duration) time.Duration {
+	if fallback <= 0 {
+		fallback = defaultNATPMPTimeout
+	}
+	if ctx == nil {
+		return fallback
+	}
+	if ctx != nil && ctx.Err() != nil {
+		return time.Millisecond
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return time.Millisecond
+		}
+		if remaining < fallback {
+			return remaining
+		}
+	}
+	return fallback
+}
+
 func requestPCPMap(ctx context.Context, gatewayAP netip.AddrPort, clientIP netip.Addr, localPort, prevExternalPort uint16, lifetimeSec int, prevExternalIP netip.Addr) (*pcpMapResponse, error) {
 	if !gatewayAP.IsValid() || !clientIP.IsValid() || localPort == 0 {
 		return nil, fmt.Errorf("invalid pcp request parameters")
 	}
+	ctx = normalizePortMappingContext(ctx)
 	if lifetimeSec < 0 {
 		lifetimeSec = 0
 	}

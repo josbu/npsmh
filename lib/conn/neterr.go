@@ -91,7 +91,6 @@ func DescribeNetError(err error, c net.Conn) string {
 	if errors.As(err, &netErr) {
 		parts = append(parts,
 			fmt.Sprintf("timeout=%t", netErr.Timeout()),
-			fmt.Sprintf("temporary=%t", netErr.Temporary()),
 		)
 	} else {
 		parts = append(parts, fmt.Sprintf("timeout=%t", IsTimeout(err)))

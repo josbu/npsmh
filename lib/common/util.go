@@ -12,9 +12,105 @@ import (
 	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata"
 
 	"github.com/araddon/dateparse"
+	"github.com/beevik/ntp"
 	"github.com/djylb/nps/lib/logs"
+)
+
+const (
+	CONN_DATA_SEQ        = "*#*" // Separator
+	VERIFY_EER           = "vkey"
+	VERIFY_SUCCESS       = "sucs"
+	WORK_MAIN            = "main"
+	WORK_CHAN            = "chan"
+	WORK_VISITOR         = "vstr"
+	WORK_CONFIG          = "conf"
+	WORK_REGISTER        = "rgst"
+	WORK_SECRET          = "sert"
+	WORK_FILE            = "file"
+	WORK_P2P             = "p2pm"
+	WORK_P2P_RESOLVE     = "p2rv"
+	WORK_P2P_SESSION     = "p2sj"
+	WORK_P2P_VISITOR     = "p2pv"
+	WORK_P2P_PROVIDER    = "p2pp"
+	WORK_P2P_CONNECT     = "p2pc"
+	WORK_P2P_SUCCESS     = "p2ps"
+	WORK_P2P_END         = "p2pe"
+	WORK_P2P_ACCEPT      = "p2pa"
+	WORK_P2P_LAST        = "p2pl"
+	WORK_P2P_NAT_PROBE   = "p2px"
+	WORK_STATUS          = "stus"
+	RES_MSG              = "msg0"
+	RES_CLOSE            = "clse"
+	NEW_UDP_CONN         = "udpc" // p2p udp conn
+	P2P_PUNCH_START      = "p2st"
+	P2P_ASSOCIATION_BIND = "p2bd"
+	P2P_PROBE_REPORT     = "p2pr"
+	P2P_PROBE_SUMMARY    = "p2sm"
+	P2P_PUNCH_READY      = "p2rd"
+	P2P_PUNCH_GO         = "p2go"
+	P2P_PUNCH_PROGRESS   = "p2pg"
+	P2P_PUNCH_ABORT      = "p2ab"
+	NEW_TASK             = "task"
+	NEW_CONF             = "conf"
+	NEW_HOST             = "host"
+	CONN_ALL             = "all"
+	CONN_TCP             = "tcp"
+	CONN_UDP             = "udp"
+	CONN_KCP             = "kcp"
+	CONN_TLS             = "tls"
+	CONN_QUIC            = "quic"
+	CONN_WEB             = "web"
+	CONN_WS              = "ws"
+	CONN_WSS             = "wss"
+	CONN_TEST            = "TST"
+	CONN_ACK             = "ACK"
+	PING                 = "ping"
+	PONG                 = "pong"
+	TEST                 = "test"
+
+	TOTP_SEQ = "totp:" // TOTP Separator
+
+	UnauthorizedBytes = "HTTP/1.1 401 Unauthorized\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"WWW-Authenticate: Basic realm=\"easyProxy\"\r\n" +
+		"\r\n" +
+		"401 Unauthorized"
+
+	ProxyAuthRequiredBytes = "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+		"Proxy-Authenticate: Basic realm=\"Proxy\"\r\n" +
+		"Content-Length: 0\r\n" +
+		"Connection: close\r\n" +
+		"\r\n"
+
+	ConnectionFailBytes = "HTTP/1.1 404 Not Found\r\n" +
+		"\r\n"
+
+	IPv4DNS = "8.8.8.8:53"
+	IPv6DNS = "[2400:3200::1]:53"
+)
+
+var DefaultPort = map[string]string{
+	"tcp":  "8024",
+	"kcp":  "8024",
+	"tls":  "8025",
+	"quic": "8025",
+	"ws":   "80",
+	"wss":  "443",
+}
+
+const defaultNTPInterval = 5 * time.Minute
+
+var (
+	timeOffset   time.Duration
+	ntpServer    string
+	syncInterval = defaultNTPInterval
+	lastSyncMono time.Time
+	timeMutex    sync.RWMutex
+	syncCh       = make(chan struct{}, 1)
+	defaultTZ    = time.Local
 )
 
 func Max(values ...int) int {
@@ -85,12 +181,18 @@ func ContainsFold(s, substr string) bool {
 
 // BytesToNum convert bytes to num
 func BytesToNum(b []byte) int {
-	var str string
-	for i := 0; i < len(b); i++ {
-		str += strconv.Itoa(int(b[i]))
+	value := 0
+	for _, item := range b {
+		switch {
+		case item >= 100:
+			value = value*1000 + int(item)
+		case item >= 10:
+			value = value*100 + int(item)
+		default:
+			value = value*10 + int(item)
+		}
 	}
-	x, _ := strconv.Atoi(str)
-	return x
+	return value
 }
 
 // TestTcpPort Judge whether the TCP port can open normally
@@ -163,9 +265,13 @@ func InIntArr(arr []int, val int) bool {
 }
 
 func in(target string, strArray []string) bool {
-	sort.Strings(strArray)
-	index := sort.SearchStrings(strArray, target)
-	return index < len(strArray) && strArray[index] == target
+	if len(strArray) == 0 {
+		return false
+	}
+	sorted := append([]string(nil), strArray...)
+	sort.Strings(sorted)
+	index := sort.SearchStrings(sorted, target)
+	return index < len(sorted) && sorted[index] == target
 }
 
 func IsBlackIp(ipPort, vkey string, blackIpList []string) bool {
@@ -196,7 +302,7 @@ func GetEnvMap() map[string]string {
 	m := make(map[string]string)
 	environ := os.Environ()
 	for i := range environ {
-		tmp := strings.Split(environ[i], "=")
+		tmp := strings.SplitN(environ[i], "=", 2)
 		if len(tmp) == 2 {
 			m[tmp[0]] = tmp[1]
 		}
@@ -281,4 +387,97 @@ func GetSyncMapLen(m *sync.Map) int {
 		return true
 	})
 	return c
+}
+
+func SetNtpServer(server string) {
+	timeMutex.Lock()
+	defer timeMutex.Unlock()
+	ntpServer = server
+}
+
+func SetNtpInterval(d time.Duration) {
+	if d <= 0 {
+		d = defaultNTPInterval
+	}
+	timeMutex.Lock()
+	defer timeMutex.Unlock()
+	syncInterval = d
+}
+
+func CalibrateTimeOffset(server string) (time.Duration, error) {
+	if server == "" {
+		return 0, nil
+	}
+	ntpTime, err := ntp.Time(server)
+	if err != nil {
+		return 0, err
+	}
+	return time.Until(ntpTime), nil
+}
+
+func TimeOffset() time.Duration {
+	timeMutex.RLock()
+	defer timeMutex.RUnlock()
+	return timeOffset
+}
+
+func TimeNow() time.Time {
+	SyncTime()
+	timeMutex.RLock()
+	defer timeMutex.RUnlock()
+	return time.Now().Add(timeOffset)
+}
+
+func SyncTime() {
+	timeMutex.RLock()
+	srv, last, interval := ntpServer, lastSyncMono, syncInterval
+	timeMutex.RUnlock()
+	if srv == "" || (!last.IsZero() && time.Since(last) < interval) {
+		return
+	}
+	select {
+	case syncCh <- struct{}{}:
+		defer func() { <-syncCh }()
+	default:
+		return
+	}
+	now := time.Now()
+	timeMutex.Lock()
+	lastSyncMono = now
+	timeMutex.Unlock()
+	offset, err := CalibrateTimeOffset(srv)
+	if err != nil {
+		logs.Error("ntp[%s] sync failed: %v", srv, err)
+	}
+	timeMutex.Lock()
+	timeOffset = offset
+	timeMutex.Unlock()
+	if offset != 0 {
+		logs.Info("ntp[%s] offset=%v", srv, offset)
+	}
+}
+
+func SetTimezone(tz string) error {
+	if tz == "" {
+		time.Local = defaultTZ
+		return nil
+	}
+	loc, err := time.LoadLocation(tz)
+	if err != nil {
+		return err
+	}
+	time.Local = loc
+	return nil
+}
+
+// TimestampToBytes 8bit
+func TimestampToBytes(ts int64) []byte {
+	b := make([]byte, 8)
+	binary.BigEndian.PutUint64(b, uint64(ts))
+	return b
+}
+
+// BytesToTimestamp 8bit
+func BytesToTimestamp(b []byte) int64 {
+	return int64(binary.BigEndian.Uint64(b))
 }

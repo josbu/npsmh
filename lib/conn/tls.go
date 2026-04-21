@@ -1,6 +1,7 @@
 package conn
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
@@ -13,9 +14,17 @@ type TlsConn struct {
 }
 
 func NewTlsConn(rawConn net.Conn, timeout time.Duration, tlsConfig *tls.Config) (*TlsConn, error) {
+	return NewTlsConnContext(context.Background(), rawConn, timeout, tlsConfig)
+}
+
+func NewTlsConnContext(ctx context.Context, rawConn net.Conn, timeout time.Duration, tlsConfig *tls.Config) (*TlsConn, error) {
 	if rawConn == nil {
 		return nil, fmt.Errorf("rawConn cannot be nil")
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout = normalizeLinkTimeout(timeout)
 
 	err := rawConn.SetDeadline(time.Now().Add(timeout))
 	if err != nil {
@@ -25,9 +34,13 @@ func NewTlsConn(rawConn net.Conn, timeout time.Duration, tlsConfig *tls.Config) 
 
 	tlsConn := tls.Client(rawConn, tlsConfig)
 
-	if err := tlsConn.Handshake(); err != nil {
-		_ = rawConn.Close()
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = tlsConn.Close()
 		return nil, fmt.Errorf("TLS handshake failed: %w", err)
+	}
+	if err := tlsConn.SetDeadline(time.Time{}); err != nil {
+		_ = tlsConn.Close()
+		return nil, fmt.Errorf("failed to clear TLS deadline after handshake: %w", err)
 	}
 
 	return &TlsConn{
@@ -37,34 +50,48 @@ func NewTlsConn(rawConn net.Conn, timeout time.Duration, tlsConfig *tls.Config) 
 }
 
 func (c *TlsConn) GetRawConn() net.Conn {
+	if c == nil {
+		return nil
+	}
 	return c.rawConn
 }
 
 func (c *TlsConn) Close() error {
+	if c == nil {
+		return nil
+	}
 	if c.Conn != nil {
 		if err := c.Conn.Close(); err != nil {
 			return fmt.Errorf("failed to close tlsConn: %w", err)
 		}
+		return nil
 	}
-
 	if c.rawConn != nil {
 		if err := c.rawConn.Close(); err != nil {
 			return fmt.Errorf("failed to close rawConn: %w", err)
 		}
 	}
-
 	return nil
 }
 
 func (c *TlsConn) Read(b []byte) (n int, err error) {
+	if c == nil || c.Conn == nil {
+		return 0, net.ErrClosed
+	}
 	return c.Conn.Read(b)
 }
 
 func (c *TlsConn) Write(b []byte) (n int, err error) {
+	if c == nil || c.Conn == nil {
+		return 0, net.ErrClosed
+	}
 	return c.Conn.Write(b)
 }
 
 func (c *TlsConn) SetDeadline(t time.Time) error {
+	if c == nil || c.Conn == nil || c.rawConn == nil {
+		return net.ErrClosed
+	}
 	if err := c.Conn.SetDeadline(t); err != nil {
 		return err
 	}
@@ -75,6 +102,9 @@ func (c *TlsConn) SetDeadline(t time.Time) error {
 }
 
 func (c *TlsConn) SetReadDeadline(t time.Time) error {
+	if c == nil || c.Conn == nil || c.rawConn == nil {
+		return net.ErrClosed
+	}
 	if err := c.Conn.SetReadDeadline(t); err != nil {
 		return err
 	}
@@ -85,6 +115,9 @@ func (c *TlsConn) SetReadDeadline(t time.Time) error {
 }
 
 func (c *TlsConn) SetWriteDeadline(t time.Time) error {
+	if c == nil || c.Conn == nil || c.rawConn == nil {
+		return net.ErrClosed
+	}
 	if err := c.Conn.SetWriteDeadline(t); err != nil {
 		return err
 	}
@@ -95,9 +128,27 @@ func (c *TlsConn) SetWriteDeadline(t time.Time) error {
 }
 
 func (c *TlsConn) LocalAddr() net.Addr {
+	if c == nil {
+		return nil
+	}
+	if c.rawConn == nil {
+		if c.Conn == nil {
+			return nil
+		}
+		return c.Conn.LocalAddr()
+	}
 	return c.rawConn.LocalAddr()
 }
 
 func (c *TlsConn) RemoteAddr() net.Addr {
-	return c.Conn.RemoteAddr()
+	if c == nil {
+		return nil
+	}
+	if c.Conn != nil {
+		return c.Conn.RemoteAddr()
+	}
+	if c.rawConn == nil {
+		return nil
+	}
+	return c.rawConn.RemoteAddr()
 }

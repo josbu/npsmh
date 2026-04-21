@@ -144,18 +144,30 @@ RestartSec=120
 WantedBy=multi-user.target
 `
 
-func UpdateNps() {
-	destPath := downloadLatest("server")
-	//复制文件到对应目录
-	copyStaticFile(destPath, "nps")
+func UpdateNps() error {
+	destPath, err := downloadLatest("server")
+	if err != nil {
+		return err
+	}
+	// Copy the downloaded payload into the install location.
+	if _, err := copyStaticFile(destPath, "nps"); err != nil {
+		return err
+	}
 	fmt.Println("Update completed, please restart")
+	return nil
 }
 
-func UpdateNpc() {
-	destPath := downloadLatest("client")
-	//复制文件到对应目录
-	copyStaticFile(destPath, "npc")
+func UpdateNpc() error {
+	destPath, err := downloadLatest("client")
+	if err != nil {
+		return err
+	}
+	// Copy the downloaded payload into the install location.
+	if _, err := copyStaticFile(destPath, "npc"); err != nil {
+		return err
+	}
 	fmt.Println("Update completed, please restart")
+	return nil
 }
 
 type release struct {
@@ -167,7 +179,19 @@ type release struct {
 	} `json:"assets"`
 }
 
-func downloadLatest(bin string) string {
+func buildDownloadTLSConfig(addr string) *tls.Config {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	cfg := &tls.Config{}
+	if net.ParseIP(host) == nil {
+		cfg.ServerName = host
+	}
+	return cfg
+}
+
+func downloadLatest(bin string) (string, error) {
 	const timeout = 5 * time.Second
 	const idleTimeout = 10 * time.Second
 	const keepAliveTime = 30 * time.Second
@@ -194,12 +218,7 @@ func downloadLatest(bin string) string {
 			if err != nil {
 				return nil, err
 			}
-			host, _, _ := net.SplitHostPort(addr)
-			tlsConf := &tls.Config{InsecureSkipVerify: true}
-			if net.ParseIP(host) == nil {
-				tlsConf.ServerName = host
-			}
-			return conn.NewTimeoutTLSConn(raw, tlsConf, idleTimeout, timeout)
+			return conn.NewTimeoutTLSConn(raw, buildDownloadTLSConfig(addr), idleTimeout, timeout)
 		},
 		TLSHandshakeTimeout:   timeout,
 		ResponseHeaderTimeout: timeout,
@@ -308,9 +327,7 @@ func downloadLatest(bin string) string {
 		destPath, err := os.MkdirTemp(os.TempDir(), "nps-")
 		if err != nil {
 			_ = resp.Body.Close()
-			//lastErr = err
-			//continue
-			log.Fatal("Failed to create temp directory:", err)
+			return "", fmt.Errorf("create temp directory: %w", err)
 		}
 
 		if err := unpackit.Unpack(reader, destPath); err != nil {
@@ -342,34 +359,36 @@ func downloadLatest(bin string) string {
 			destPath = strings.ReplaceAll(destPath, `\conf`, "")
 			destPath = strings.ReplaceAll(destPath, "/conf", "")
 		}
-		return destPath
+		return destPath, nil
 	}
-	log.Fatalf("All mirrors failed; last error: %v", lastErr)
-	return ""
+	if lastErr == nil {
+		lastErr = errors.New("download failed")
+	}
+	return "", fmt.Errorf("all mirrors failed: %w", lastErr)
 }
 
-func copyStaticFile(srcPath, bin string) string {
+func copyStaticFile(srcPath, bin string) (string, error) {
 	path := common.GetInstallPath()
 	if bin == "nps" {
 		if err := CopyDir(filepath.Join(srcPath, "web", "views"), filepath.Join(path, "web", "views")); err != nil {
 			if exists, _ := pathExists(filepath.Join(path, "web", "views")); exists {
 				goto ExecPath
 			}
-			log.Fatalln(err)
+			return "", err
 		}
 		chMod(filepath.Join(path, "web", "views"), 0766)
 		if err := CopyDir(filepath.Join(srcPath, "web", "static"), filepath.Join(path, "web", "static")); err != nil {
 			if exists, _ := pathExists(filepath.Join(path, "web", "static")); exists {
 				goto ExecPath
 			}
-			log.Fatalln(err)
+			return "", err
 		}
 		chMod(filepath.Join(path, "web", "static"), 0766)
 		if _, err := copyFile(filepath.Join(srcPath, "conf", "nps.conf"), filepath.Join(path, "conf", "nps.conf.default")); err != nil {
 			if exists, _ := pathExists(filepath.Join(path, "conf", "nps.conf")); exists {
 				goto ExecPath
 			}
-			log.Fatalln(err)
+			return "", err
 		}
 		chMod(filepath.Join(path, "conf", "nps.conf.default"), 0766)
 	}
@@ -384,7 +403,7 @@ ExecPath:
 		chMod(binPath, 0755)
 		if _, err := copyFile(filepath.Join(srcPath, bin), "/usr/bin/"+bin); err != nil {
 			if _, err := copyFile(filepath.Join(srcPath, bin), "/usr/local/bin/"+bin); err != nil {
-				log.Fatalln(err)
+				return "", err
 			}
 			_, _ = copyFile(filepath.Join(srcPath, bin), "/usr/local/bin/"+bin+"-update")
 			chMod("/usr/local/bin/"+bin+"-update", 0755)
@@ -399,34 +418,42 @@ ExecPath:
 		_, _ = copyFile(filepath.Join(srcPath, bin+".exe"), filepath.Join(common.GetAppPath(), bin+".exe"))
 	}
 	chMod(binPath, 0755)
-	return binPath
+	return binPath, nil
 }
 
-func NPC() {
+func NPC() error {
 	path := common.GetInstallPath()
 	if !common.FileExists(path) {
 		err := os.MkdirAll(path, 0755)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 	}
-	copyStaticFile(common.GetAppPath(), "npc")
+	_, err := copyStaticFile(common.GetAppPath(), "npc")
+	return err
 }
 
-func NPS() string {
+func NPS() (string, error) {
 	path := common.GetInstallPath()
 	log.Println("install path:" + path)
 	if common.FileExists(path) {
-		MkidrDirAll(path, "web/static", "web/views")
+		if err := MkidrDirAll(path, "web/static", "web/views"); err != nil {
+			return "", err
+		}
 	} else {
-		MkidrDirAll(path, "conf", "web/static", "web/views")
+		if err := MkidrDirAll(path, "conf", "web/static", "web/views"); err != nil {
+			return "", err
+		}
 		// not copy config if the config file is exist
 		if err := CopyDir(filepath.Join(common.GetAppPath(), "conf"), filepath.Join(path, "conf")); err != nil {
-			log.Fatalln(err)
+			return "", err
 		}
 		chMod(filepath.Join(path, "conf"), 0766)
 	}
-	binPath := copyStaticFile(common.GetAppPath(), "nps")
+	binPath, err := copyStaticFile(common.GetAppPath(), "nps")
+	if err != nil {
+		return "", err
+	}
 	log.Println("install ok!")
 	log.Println("Static files and configuration files in the current directory will be useless")
 	log.Println("The new configuration file is located in", path, "you can edit them")
@@ -440,19 +467,20 @@ nps.exe start|stop|restart|uninstall|update or nps-update.exe update
 now!`)
 	}
 	chMod(common.GetLogPath(), 0777)
-	return binPath
+	return binPath, nil
 }
 
-func MkidrDirAll(path string, v ...string) {
+func MkidrDirAll(path string, v ...string) error {
 	for _, item := range v {
 		if err := os.MkdirAll(filepath.Join(path, item), 0755); err != nil {
-			log.Fatalf("Failed to create directory %s error:%s", path, err.Error())
+			return fmt.Errorf("create directory %s: %w", filepath.Join(path, item), err)
 		}
 	}
+	return nil
 }
 
 func CopyDir(srcPath string, destPath string) error {
-	//检测目录正确性
+	// Validate source and destination before copying any content.
 	if srcInfo, err := os.Stat(srcPath); err != nil {
 		//fmt.Println(err.Error())
 		log.Println("Failed to copy source directory.")
@@ -475,24 +503,31 @@ func CopyDir(srcPath string, destPath string) error {
 			return errors.New("destInfo is not the right directory")
 		}
 	}
-	err := filepath.Walk(srcPath, func(path string, f os.FileInfo, err error) error {
-		if f == nil {
+	return filepath.Walk(srcPath, func(path string, f os.FileInfo, err error) error {
+		if err != nil {
 			return err
 		}
+		if f == nil {
+			return nil
+		}
 		if !f.IsDir() {
-			destNewPath := strings.ReplaceAll(path, srcPath, destPath)
+			relPath, relErr := filepath.Rel(srcPath, path)
+			if relErr != nil {
+				return relErr
+			}
+			destNewPath := filepath.Join(destPath, relPath)
 			log.Println("copy file: " + path + " -> " + destNewPath)
-			_, _ = copyFile(path, destNewPath)
+			if _, copyErr := copyFile(path, destNewPath); copyErr != nil {
+				return copyErr
+			}
 			if !common.IsWindows() {
 				chMod(destNewPath, 0766)
 			}
 		}
 		return nil
 	})
-	return err
 }
 
-// 生成目录并拷贝文件
 func copyFile(src, dest string) (w int64, err error) {
 	srcAbs, err := filepath.Abs(src)
 	if err != nil {
@@ -511,49 +546,61 @@ func copyFile(src, dest string) (w int64, err error) {
 		return
 	}
 	defer func() { _ = srcFile.Close() }()
-	// 确保目录存在
+	srcInfo, err := srcFile.Stat()
+	if err != nil {
+		return 0, err
+	}
+	if srcInfo.IsDir() {
+		return 0, errors.New("src is a directory")
+	}
+	// Ensure the destination directory exists before creating the file.
 	dirPath := filepath.Dir(dest)
 	if exists, _ := pathExists(dirPath); !exists {
 		log.Println("mkdir all:", dirPath)
 		if err := os.MkdirAll(dirPath, os.ModePerm); err != nil {
-			log.Fatalln(err)
+			return 0, err
 		}
 	}
 
-	dstFile, err := os.Create(dest)
-	if err == nil {
-		defer func() { _ = dstFile.Close() }()
-		if n, copyErr := io.Copy(dstFile, srcFile); copyErr == nil {
-			return n, nil
-		}
-	}
-
-	tmpPath := dest + ".tmp"
-	if _, statErr := os.Stat(tmpPath); statErr == nil {
-		_ = os.Remove(tmpPath)
-	}
-
-	tmpFile, err := os.Create(tmpPath)
+	tmpFile, err := os.CreateTemp(dirPath, filepath.Base(dest)+".tmp-*")
 	if err != nil {
 		return 0, err
 	}
-	defer func() { _ = tmpFile.Close() }()
-	if _, err = srcFile.Seek(0, io.SeekStart); err != nil {
-		return 0, err
+	tmpPath := tmpFile.Name()
+	cleanupTmp := true
+	defer func() {
+		_ = tmpFile.Close()
+		if cleanupTmp {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	if !common.IsWindows() {
+		if chmodErr := tmpFile.Chmod(srcInfo.Mode()); chmodErr != nil {
+			return 0, chmodErr
+		}
 	}
 	n, err := io.Copy(tmpFile, srcFile)
 	if err != nil {
 		return n, err
 	}
-
-	_ = tmpFile.Close()
+	if syncErr := tmpFile.Sync(); syncErr != nil {
+		return n, syncErr
+	}
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		return n, closeErr
+	}
+	if common.IsWindows() {
+		if removeErr := os.Remove(dest); removeErr != nil && !os.IsNotExist(removeErr) {
+			return n, removeErr
+		}
+	}
 	if renameErr := os.Rename(tmpPath, dest); renameErr != nil {
 		return n, renameErr
 	}
+	cleanupTmp = false
 	return n, nil
 }
 
-// 检测文件夹路径是否存在
 func pathExists(path string) (bool, error) {
 	_, err := os.Stat(path)
 	if err == nil {

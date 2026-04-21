@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strconv"
 	"syscall"
 	"unsafe"
 
@@ -44,6 +45,18 @@ func ioctl(s uintptr, ioc int, b []byte) error {
 }
 
 func GetAddress(conn net.Conn) (string, error) {
+	dst, err := redirectedDestinationFromPF(conn)
+	if err == nil {
+		return dst, nil
+	}
+	localDst, localErr := transparentDestinationFromLocalAddr(conn.LocalAddr())
+	if localErr == nil {
+		return localDst, nil
+	}
+	return "", fmt.Errorf("failed to get transparent address: pf=%v local=%v", err, localErr)
+}
+
+func redirectedDestinationFromPF(conn net.Conn) (string, error) {
 	f, err := os.Open("/dev/pf")
 	if err != nil {
 		return "", fmt.Errorf("failed to open /dev/pf: %v", err)
@@ -121,5 +134,16 @@ func GetAddress(conn net.Conn) (string, error) {
 		copy(odIP, nl.Rdaddr[:])
 	}
 
-	return fmt.Sprintf("%s:%d", odIP.String(), odPort), nil
+	return net.JoinHostPort(odIP.String(), strconv.Itoa(int(odPort))), nil
+}
+
+func transparentDestinationFromLocalAddr(addr net.Addr) (string, error) {
+	tcpAddr, ok := addr.(*net.TCPAddr)
+	if !ok || tcpAddr == nil {
+		return "", fmt.Errorf("local address is not tcp: %T", addr)
+	}
+	if tcpAddr.IP == nil || tcpAddr.IP.IsUnspecified() || tcpAddr.Port <= 0 {
+		return "", fmt.Errorf("invalid local address %v", addr)
+	}
+	return net.JoinHostPort(tcpAddr.IP.String(), strconv.Itoa(tcpAddr.Port)), nil
 }

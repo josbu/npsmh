@@ -1,14 +1,34 @@
 package conn
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/djylb/nps/lib/common"
 )
+
+var smartUDPReadErrorEnqueueTimeout = 250 * time.Millisecond
+var smartUDPPacketQueueSize = 256
+var errSmartUDPNoPacketConn = errors.New("smart udp: no packet conn available")
+
+func normalizedSmartUDPReadErrorEnqueueTimeout() time.Duration {
+	if smartUDPReadErrorEnqueueTimeout <= 0 {
+		return 250 * time.Millisecond
+	}
+	return smartUDPReadErrorEnqueueTimeout
+}
+
+func normalizedSmartUDPPacketQueueSize() int {
+	if smartUDPPacketQueueSize <= 0 {
+		return 256
+	}
+	return smartUDPPacketQueueSize
+}
 
 type packet struct {
 	buf  []byte
@@ -30,14 +50,20 @@ type SmartUdpConn struct {
 }
 
 func NewSmartUdpConn(conns []net.PacketConn, addr *net.UDPAddr) *SmartUdpConn {
+	filtered := make([]net.PacketConn, 0, len(conns))
+	for _, c := range conns {
+		if c != nil {
+			filtered = append(filtered, c)
+		}
+	}
 	s := &SmartUdpConn{
-		conns:     conns,
+		conns:     filtered,
 		fakeLocal: addr,
-		packetCh:  make(chan packet, 1024),
+		packetCh:  make(chan packet, normalizedSmartUDPPacketQueueSize()),
 		quit:      make(chan struct{}),
 	}
-	s.wg.Add(len(conns))
-	for _, c := range conns {
+	s.wg.Add(len(filtered))
+	for _, c := range filtered {
 		go s.readLoop(c)
 	}
 	return s
@@ -45,6 +71,9 @@ func NewSmartUdpConn(conns []net.PacketConn, addr *net.UDPAddr) *SmartUdpConn {
 
 func (s *SmartUdpConn) readLoop(c net.PacketConn) {
 	defer s.wg.Done()
+	if c == nil {
+		return
+	}
 	for {
 		buf := common.BufPool.Get()
 		n, addr, err := c.ReadFrom(buf)
@@ -60,7 +89,25 @@ func (s *SmartUdpConn) readLoop(c net.PacketConn) {
 		case s.packetCh <- pkt:
 			// delivered, buffer will be returned in ReadFrom or on flush
 		default:
-			common.BufPool.Put(buf)
+			if err != nil {
+				timer := time.NewTimer(normalizedSmartUDPReadErrorEnqueueTimeout())
+				select {
+				case <-s.quit:
+					if !timer.Stop() {
+						<-timer.C
+					}
+					common.BufPool.Put(buf)
+					return
+				case s.packetCh <- pkt:
+					if !timer.Stop() {
+						<-timer.C
+					}
+				case <-timer.C:
+					common.BufPool.Put(buf)
+				}
+			} else {
+				common.BufPool.Put(buf)
+			}
 		}
 
 		if err != nil {
@@ -87,9 +134,19 @@ func (s *SmartUdpConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 	if !ok {
 		return 0, fmt.Errorf("unsupported addr type %T", addr)
 	}
+	fallback := s.firstPacketConn()
+	if fallback == nil {
+		return 0, errSmartUDPNoPacketConn
+	}
 	want4 := udpAddr.IP.To4() != nil
 	for _, c := range s.conns {
-		la := c.LocalAddr().(*net.UDPAddr)
+		if c == nil {
+			continue
+		}
+		la, ok := c.LocalAddr().(*net.UDPAddr)
+		if !ok || la == nil {
+			continue
+		}
 		is4 := la.IP == nil || la.IP.To4() != nil
 		if is4 == want4 {
 			s.mu.Lock()
@@ -99,9 +156,21 @@ func (s *SmartUdpConn) WriteTo(p []byte, addr net.Addr) (int, error) {
 		}
 	}
 	s.mu.Lock()
-	s.lastConn = s.conns[0]
+	s.lastConn = fallback
 	s.mu.Unlock()
-	return s.conns[0].WriteTo(p, addr)
+	return fallback.WriteTo(p, addr)
+}
+
+func (s *SmartUdpConn) firstPacketConn() net.PacketConn {
+	if s == nil {
+		return nil
+	}
+	for _, c := range s.conns {
+		if c != nil {
+			return c
+		}
+	}
+	return nil
 }
 
 func (s *SmartUdpConn) UDPConns() []*net.UDPConn {
@@ -118,8 +187,11 @@ func (s *SmartUdpConn) Close() error {
 	s.closeOnce.Do(func() {
 		close(s.quit)
 		for _, c := range s.conns {
+			if c == nil {
+				continue
+			}
 			if err := c.Close(); err != nil {
-				s.closeErr = err
+				s.closeErr = errors.Join(s.closeErr, err)
 			}
 		}
 		s.wg.Wait()
@@ -143,6 +215,9 @@ func (s *SmartUdpConn) LocalAddr() net.Addr {
 
 func (s *SmartUdpConn) SetDeadline(t time.Time) error {
 	for _, c := range s.conns {
+		if c == nil {
+			continue
+		}
 		_ = c.SetDeadline(t)
 	}
 	return nil
@@ -150,6 +225,9 @@ func (s *SmartUdpConn) SetDeadline(t time.Time) error {
 
 func (s *SmartUdpConn) SetReadDeadline(t time.Time) error {
 	for _, c := range s.conns {
+		if c == nil {
+			continue
+		}
 		_ = c.SetReadDeadline(t)
 	}
 	return nil
@@ -157,7 +235,33 @@ func (s *SmartUdpConn) SetReadDeadline(t time.Time) error {
 
 func (s *SmartUdpConn) SetWriteDeadline(t time.Time) error {
 	for _, c := range s.conns {
+		if c == nil {
+			continue
+		}
 		_ = c.SetWriteDeadline(t)
 	}
 	return nil
+}
+
+func resolveUDPBindTarget(addr string) (*net.UDPAddr, string, string, bool, error) {
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil, "", "", false, err
+	}
+	host := common.GetIpByAddr(addr)
+	if host == "" {
+		return udpAddr, "", "", false, nil
+	}
+	ip := common.NormalizeIP(udpAddr.IP)
+	if ip == nil {
+		ip = common.NormalizeIP(net.ParseIP(host))
+	}
+	if ip == nil {
+		return nil, "", "", false, fmt.Errorf("invalid udp bind ip %q", host)
+	}
+	network := "udp6"
+	if ip.To4() != nil {
+		network = "udp4"
+	}
+	return udpAddr, network, net.JoinHostPort(ip.String(), strconv.Itoa(udpAddr.Port)), true, nil
 }

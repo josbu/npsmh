@@ -11,7 +11,7 @@ import (
 )
 
 type probeSession struct {
-	mu           sync.Mutex
+	mu           sync.RWMutex
 	sessionID    string
 	routeKey     string
 	token        string
@@ -24,6 +24,7 @@ var (
 	probeSessionsByID    sync.Map
 	probeSessionsByRoute sync.Map
 	cleanerOnce          sync.Once
+	currentProbeTime     = time.Now
 )
 
 func Register(sessionID string, wire p2p.P2PWireSpec, token string, ttl time.Duration) {
@@ -38,14 +39,13 @@ func Register(sessionID string, wire p2p.P2PWireSpec, token string, ttl time.Dur
 		ttl = 30 * time.Second
 	}
 	startCleaner()
-	session := &probeSession{
-		sessionID:    sessionID,
-		routeKey:     routeKey,
-		token:        token,
-		expiresAt:    time.Now().Add(ttl),
-		observations: make(map[string]map[string]p2p.ProbeSample),
-		replay:       p2p.NewReplayWindow(30 * time.Second),
+	if existing := getByID(sessionID); existing != nil {
+		deleteSession(existing)
 	}
+	if existing := getByRoute(routeKey); existing != nil {
+		deleteSession(existing)
+	}
+	session := newProbeSession(sessionID, routeKey, token, currentProbeTime().Add(ttl))
 	probeSessionsByID.Store(sessionID, session)
 	probeSessionsByRoute.Store(routeKey, session)
 }
@@ -54,11 +54,16 @@ func Unregister(sessionID string) {
 	if sessionID == "" {
 		return
 	}
-	session := getByID(sessionID)
-	if session != nil && session.routeKey != "" {
-		probeSessionsByRoute.Delete(session.routeKey)
+	value, ok := probeSessionsByID.Load(sessionID)
+	if !ok {
+		return
 	}
-	probeSessionsByID.Delete(sessionID)
+	session, ok := value.(*probeSession)
+	if ok && session != nil {
+		deleteSession(session)
+		return
+	}
+	deleteSessionIDValueIfCurrent(sessionID, value)
 }
 
 func ValidateToken(sessionID, token string) bool {
@@ -66,13 +71,12 @@ func ValidateToken(sessionID, token string) bool {
 	if session == nil {
 		return false
 	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if time.Now().After(session.expiresAt) {
+	expired, tokenMatch := session.validateToken(currentProbeTime(), token)
+	if expired {
 		deleteSession(session)
 		return false
 	}
-	return session.token == token
+	return tokenMatch
 }
 
 func LookupSession(routeKey string) (p2p.UDPPacketLookupResult, bool) {
@@ -80,19 +84,15 @@ func LookupSession(routeKey string) (p2p.UDPPacketLookupResult, bool) {
 	if session == nil {
 		return p2p.UDPPacketLookupResult{}, false
 	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if time.Now().After(session.expiresAt) {
+	lookup, expired := session.lookup(currentProbeTime())
+	if expired {
 		deleteSession(session)
 		return p2p.UDPPacketLookupResult{}, false
 	}
-	if session.token == "" {
+	if lookup.Token == "" {
 		return p2p.UDPPacketLookupResult{}, false
 	}
-	return p2p.UDPPacketLookupResult{
-		SessionID: session.sessionID,
-		Token:     session.token,
-	}, true
+	return lookup, true
 }
 
 func RecordObservation(routeKey, role string, sample p2p.ProbeSample) {
@@ -103,16 +103,9 @@ func RecordObservation(routeKey, role string, sample p2p.ProbeSample) {
 	if session == nil {
 		return
 	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if time.Now().After(session.expiresAt) {
+	if expired := session.recordObservation(currentProbeTime(), role, sample); expired {
 		deleteSession(session)
-		return
 	}
-	if _, ok := session.observations[role]; !ok {
-		session.observations[role] = make(map[string]p2p.ProbeSample)
-	}
-	session.observations[role][observationKey(sample)] = sample
 }
 
 func AcceptPacket(routeKey string, timestampMs int64, nonce string) bool {
@@ -120,16 +113,11 @@ func AcceptPacket(routeKey string, timestampMs int64, nonce string) bool {
 	if session == nil {
 		return false
 	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if time.Now().After(session.expiresAt) {
+	accepted, expired := session.acceptPacket(currentProbeTime(), timestampMs, nonce)
+	if expired {
 		deleteSession(session)
-		return false
 	}
-	if session.replay == nil {
-		return true
-	}
-	return session.replay.Accept(timestampMs, nonce)
+	return accepted
 }
 
 func GetObservations(sessionID, role string) []p2p.ProbeSample {
@@ -140,19 +128,13 @@ func GetObservations(sessionID, role string) []p2p.ProbeSample {
 	if session == nil {
 		return nil
 	}
-	session.mu.Lock()
-	defer session.mu.Unlock()
-	if time.Now().After(session.expiresAt) {
+	samples, expired := session.observationsForRole(currentProbeTime(), role)
+	if expired {
 		deleteSession(session)
 		return nil
 	}
-	byPort, ok := session.observations[role]
-	if !ok {
+	if len(samples) == 0 {
 		return nil
-	}
-	samples := make([]p2p.ProbeSample, 0, len(byPort))
-	for _, sample := range byPort {
-		samples = append(samples, sample)
 	}
 	sort.Slice(samples, func(i, j int) bool {
 		if samples[i].ProbePort != samples[j].ProbePort {
@@ -174,6 +156,102 @@ func observationKey(sample p2p.ProbeSample) string {
 	return fmt.Sprintf("%d|%s", sample.ProbePort, replyAddr)
 }
 
+func newProbeSession(sessionID, routeKey, token string, expiresAt time.Time) *probeSession {
+	return &probeSession{
+		sessionID:    sessionID,
+		routeKey:     routeKey,
+		token:        token,
+		expiresAt:    expiresAt,
+		observations: make(map[string]map[string]p2p.ProbeSample),
+		replay:       p2p.NewReplayWindow(30 * time.Second),
+	}
+}
+
+func (s *probeSession) expiredLocked(now time.Time) bool {
+	return !now.Before(s.expiresAt)
+}
+
+func (s *probeSession) expired(now time.Time) bool {
+	if s == nil {
+		return true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.expiredLocked(now)
+}
+
+func (s *probeSession) validateToken(now time.Time, token string) (expired, matched bool) {
+	if s == nil {
+		return true, false
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.expiredLocked(now), s.token == token
+}
+
+func (s *probeSession) lookup(now time.Time) (p2p.UDPPacketLookupResult, bool) {
+	if s == nil {
+		return p2p.UDPPacketLookupResult{}, true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return p2p.UDPPacketLookupResult{
+		SessionID: s.sessionID,
+		Token:     s.token,
+	}, s.expiredLocked(now)
+}
+
+func (s *probeSession) recordObservation(now time.Time, role string, sample p2p.ProbeSample) bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.expiredLocked(now) {
+		return true
+	}
+	if _, ok := s.observations[role]; !ok {
+		s.observations[role] = make(map[string]p2p.ProbeSample)
+	}
+	s.observations[role][observationKey(sample)] = sample
+	return false
+}
+
+func (s *probeSession) acceptPacket(now time.Time, timestampMs int64, nonce string) (accepted, expired bool) {
+	if s == nil {
+		return false, true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.expiredLocked(now) {
+		return false, true
+	}
+	if s.replay == nil {
+		return true, false
+	}
+	return s.replay.Accept(timestampMs, nonce), false
+}
+
+func (s *probeSession) observationsForRole(now time.Time, role string) ([]p2p.ProbeSample, bool) {
+	if s == nil {
+		return nil, true
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.expiredLocked(now) {
+		return nil, true
+	}
+	byPort, ok := s.observations[role]
+	if !ok {
+		return nil, false
+	}
+	samples := make([]p2p.ProbeSample, 0, len(byPort))
+	for _, sample := range byPort {
+		samples = append(samples, sample)
+	}
+	return samples, false
+}
+
 func getByID(sessionID string) *probeSession {
 	if sessionID == "" {
 		return nil
@@ -184,6 +262,7 @@ func getByID(sessionID string) *probeSession {
 	}
 	session, ok := value.(*probeSession)
 	if !ok || session == nil {
+		deleteSessionIDValueIfCurrent(sessionID, value)
 		return nil
 	}
 	return session
@@ -199,6 +278,7 @@ func getByRoute(routeKey string) *probeSession {
 	}
 	session, ok := value.(*probeSession)
 	if !ok || session == nil {
+		deleteSessionRouteValueIfCurrent(routeKey, value)
 		return nil
 	}
 	return session
@@ -209,11 +289,77 @@ func deleteSession(session *probeSession) {
 		return
 	}
 	if session.routeKey != "" {
-		probeSessionsByRoute.Delete(session.routeKey)
+		probeSessionsByRoute.CompareAndDelete(session.routeKey, session)
 	}
 	if session.sessionID != "" {
-		probeSessionsByID.Delete(session.sessionID)
+		probeSessionsByID.CompareAndDelete(session.sessionID, session)
 	}
+}
+
+func deleteSessionIDValueIfCurrent(sessionID string, value interface{}) bool {
+	if sessionID == "" || value == nil {
+		return false
+	}
+	return probeSessionsByID.CompareAndDelete(sessionID, value)
+}
+
+func deleteSessionIDEntryIfCurrent(key, value interface{}) bool {
+	if key == nil || value == nil {
+		return false
+	}
+	return probeSessionsByID.CompareAndDelete(key, value)
+}
+
+func deleteSessionRouteValueIfCurrent(routeKey string, value interface{}) bool {
+	if routeKey == "" || value == nil {
+		return false
+	}
+	return probeSessionsByRoute.CompareAndDelete(routeKey, value)
+}
+
+func deleteSessionRouteEntryIfCurrent(key, value interface{}) bool {
+	if key == nil || value == nil {
+		return false
+	}
+	return probeSessionsByRoute.CompareAndDelete(key, value)
+}
+
+func cleanupProbeSessionIDEntries(now time.Time) {
+	probeSessionsByID.Range(func(key, value any) bool {
+		session, ok := value.(*probeSession)
+		if !ok || session == nil {
+			deleteSessionIDEntryIfCurrent(key, value)
+			return true
+		}
+		sessionID, ok := key.(string)
+		if !ok || sessionID == "" || sessionID != session.sessionID {
+			deleteSessionIDEntryIfCurrent(key, value)
+			return true
+		}
+		if session.expired(now) {
+			deleteSession(session)
+		}
+		return true
+	})
+}
+
+func cleanupProbeSessionRouteEntries(now time.Time) {
+	probeSessionsByRoute.Range(func(key, value any) bool {
+		session, ok := value.(*probeSession)
+		if !ok || session == nil {
+			deleteSessionRouteEntryIfCurrent(key, value)
+			return true
+		}
+		routeKey, ok := key.(string)
+		if !ok || routeKey == "" || routeKey != session.routeKey {
+			deleteSessionRouteEntryIfCurrent(key, value)
+			return true
+		}
+		if session.expired(now) {
+			deleteSession(session)
+		}
+		return true
+	})
 }
 
 func startCleaner() {
@@ -222,21 +368,9 @@ func startCleaner() {
 			ticker := time.NewTicker(time.Minute)
 			defer ticker.Stop()
 			for range ticker.C {
-				now := time.Now()
-				probeSessionsByID.Range(func(key, value any) bool {
-					session, ok := value.(*probeSession)
-					if !ok || session == nil {
-						probeSessionsByID.Delete(key)
-						return true
-					}
-					session.mu.Lock()
-					expired := now.After(session.expiresAt)
-					session.mu.Unlock()
-					if expired {
-						deleteSession(session)
-					}
-					return true
-				})
+				now := currentProbeTime()
+				cleanupProbeSessionIDEntries(now)
+				cleanupProbeSessionRouteEntries(now)
 			}
 		}()
 	})

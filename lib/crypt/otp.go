@@ -18,6 +18,7 @@ import (
 const TotpLen = 6
 
 var b32 = base32.StdEncoding.WithPadding(base32.NoPadding)
+var newQRCode = qrcode.New
 
 func totpValue(key []byte, counter int64) int {
 	buf := make([]byte, 8)
@@ -42,7 +43,9 @@ func GenerateTOTPSecret() (string, error) {
 }
 
 func ValidateTOTPCode(secret, code string) (bool, error) {
-	key, err := b32.DecodeString(strings.ToUpper(secret))
+	secret = strings.ToUpper(strings.TrimSpace(secret))
+	code = strings.TrimSpace(code)
+	key, err := b32.DecodeString(secret)
 	if err != nil {
 		return false, err
 	}
@@ -60,7 +63,8 @@ func ValidateTOTPCode(secret, code string) (bool, error) {
 }
 
 func GetTOTPCode(secret string) (string, int64, error) {
-	key, err := b32.DecodeString(strings.ToUpper(secret))
+	secret = strings.ToUpper(strings.TrimSpace(secret))
+	key, err := b32.DecodeString(secret)
 	if err != nil {
 		return "", 0, err
 	}
@@ -73,6 +77,7 @@ func GetTOTPCode(secret string) (string, int64, error) {
 }
 
 func IsValidTOTPSecret(secret string) bool {
+	secret = strings.ToUpper(strings.TrimSpace(secret))
 	if _, err := b32.DecodeString(secret); err != nil {
 		return false
 	}
@@ -110,9 +115,10 @@ func PrintTOTPSecret() {
 	}
 	fmt.Printf("Your new 2FA secret is: %s\nPlease add this secret to your nps.conf configuration file.\n", secret)
 	totpUrl := BuildTotpUri("", "NPS", secret)
-	qr, err := qrcode.New(totpUrl, qrcode.Medium)
+	qr, err := newQRCode(totpUrl, qrcode.Medium)
 	if err != nil {
-		panic(err)
+		fmt.Printf("Failed to generate 2FA QR code: %v\n", err)
+		return
 	}
 	ascii := qr.ToString(false)
 	fmt.Println(ascii)

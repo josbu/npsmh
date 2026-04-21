@@ -22,6 +22,9 @@ type FramedConn struct {
 func WrapFramed(c net.Conn) *FramedConn { return &FramedConn{Conn: c} }
 
 func (fc *FramedConn) Read(p []byte) (int, error) {
+	if fc == nil || fc.Conn == nil {
+		return 0, net.ErrClosed
+	}
 	fc.rmu.Lock()
 	defer fc.rmu.Unlock()
 
@@ -60,48 +63,101 @@ func (fc *FramedConn) Read(p []byte) (int, error) {
 }
 
 func (fc *FramedConn) Write(p []byte) (int, error) {
+	if fc == nil || fc.Conn == nil {
+		return 0, net.ErrClosed
+	}
 	fc.wmu.Lock()
 	defer fc.wmu.Unlock()
 
-	send := len(p)
-	if send > MaxFramePayload {
-		send = MaxFramePayload
+	if len(p) == 0 {
+		return 0, fc.writeFrame(nil)
 	}
 
-	var hdr [2]byte
-	binary.BigEndian.PutUint16(hdr[:], uint16(send))
-	for off := 0; off < len(hdr); {
-		n, err := fc.Conn.Write(hdr[off:])
-		if n > 0 {
-			off += n
+	written := 0
+	for len(p) > 0 {
+		chunk := p
+		if len(chunk) > MaxFramePayload {
+			chunk = chunk[:MaxFramePayload]
 		}
-		if err != nil {
-			return 0, err
+		if err := fc.writeFrame(chunk); err != nil {
+			return written, err
 		}
-		if n == 0 {
-			return 0, io.ErrShortWrite
-		}
+		written += len(chunk)
+		p = p[len(chunk):]
 	}
 
-	for off := 0; off < send; {
-		n, err := fc.Conn.Write(p[off:send])
-		if n > 0 {
-			off += n
-		}
-		if err != nil {
-			return 0, err
-		}
-		if n == 0 {
-			return 0, io.ErrShortWrite
-		}
-	}
-
-	return len(p), nil
+	return written, nil
 }
 
-func (fc *FramedConn) SetDeadline(t time.Time) error      { return fc.Conn.SetDeadline(t) }
-func (fc *FramedConn) SetReadDeadline(t time.Time) error  { return fc.Conn.SetReadDeadline(t) }
-func (fc *FramedConn) SetWriteDeadline(t time.Time) error { return fc.Conn.SetWriteDeadline(t) }
-func (fc *FramedConn) LocalAddr() net.Addr                { return fc.Conn.LocalAddr() }
-func (fc *FramedConn) RemoteAddr() net.Addr               { return fc.Conn.RemoteAddr() }
-func (fc *FramedConn) Close() error                       { return fc.Conn.Close() }
+func (fc *FramedConn) SetDeadline(t time.Time) error {
+	if fc == nil || fc.Conn == nil {
+		return net.ErrClosed
+	}
+	return fc.Conn.SetDeadline(t)
+}
+
+func (fc *FramedConn) SetReadDeadline(t time.Time) error {
+	if fc == nil || fc.Conn == nil {
+		return net.ErrClosed
+	}
+	return fc.Conn.SetReadDeadline(t)
+}
+
+func (fc *FramedConn) SetWriteDeadline(t time.Time) error {
+	if fc == nil || fc.Conn == nil {
+		return net.ErrClosed
+	}
+	return fc.Conn.SetWriteDeadline(t)
+}
+
+func (fc *FramedConn) LocalAddr() net.Addr {
+	if fc == nil || fc.Conn == nil {
+		return nil
+	}
+	return fc.Conn.LocalAddr()
+}
+
+func (fc *FramedConn) RemoteAddr() net.Addr {
+	if fc == nil || fc.Conn == nil {
+		return nil
+	}
+	return fc.Conn.RemoteAddr()
+}
+
+func (fc *FramedConn) Close() error {
+	if fc == nil || fc.Conn == nil {
+		return net.ErrClosed
+	}
+	return fc.Conn.Close()
+}
+
+func (fc *FramedConn) writeFrame(p []byte) error {
+	if fc == nil || fc.Conn == nil {
+		return net.ErrClosed
+	}
+	var hdr [2]byte
+	binary.BigEndian.PutUint16(hdr[:], uint16(len(p)))
+	if err := writeAll(fc.Conn, hdr[:]); err != nil {
+		return err
+	}
+	if len(p) == 0 {
+		return nil
+	}
+	return writeAll(fc.Conn, p)
+}
+
+func writeAll(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n > 0 {
+			p = p[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}

@@ -2,15 +2,12 @@ package file
 
 import (
 	"errors"
-	"net/http"
 	"sort"
-	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/djylb/nps/lib/common"
-	"github.com/djylb/nps/lib/crypt"
 	"github.com/djylb/nps/lib/index"
-	"github.com/djylb/nps/lib/rate"
 )
 
 type DbUtils struct {
@@ -18,644 +15,550 @@ type DbUtils struct {
 }
 
 var (
-	Db                *DbUtils
-	once              sync.Once
-	HostIndex         = index.NewDomainIndex()
-	Blake2bVkeyIndex  = index.NewStringIDIndex()
-	TaskPasswordIndex = index.NewStringIDIndex()
+	Db                  *DbUtils
+	once                sync.Once
+	dbMu                sync.RWMutex
+	HostIndex           = index.NewDomainIndex()
+	Blake2bVkeyIndex    = index.NewStringIDIndex()
+	TaskPasswordIndex   = index.NewStringIDIndex()
+	PlatformUserIndex   = index.NewStringIDIndex()
+	UsernameIndex       = index.NewStringIDIndex()
+	ErrUserNotFound     = errors.New("user not found")
+	ErrClientNotFound   = errors.New("client not found")
+	ErrTaskNotFound     = errors.New("task not found")
+	ErrHostNotFound     = errors.New("host not found")
+	ErrRevisionConflict = errors.New("resource revision conflict")
 )
+
+var (
+	hostIndexPtr         atomic.Pointer[index.DomainIndex]
+	blake2bVkeyIndexPtr  atomic.Pointer[index.StringIDIndex]
+	taskPasswordIndexPtr atomic.Pointer[index.StringIDIndex]
+	platformUserIndexPtr atomic.Pointer[index.StringIDIndex]
+	usernameIndexPtr     atomic.Pointer[index.StringIDIndex]
+)
+
+// RuntimeIndexes groups the mutable package-level indexes so tests and
+// migration paths can swap them as one coherent set instead of writing each
+// global pointer independently.
+type RuntimeIndexes struct {
+	HostIndex         *index.DomainIndex
+	Blake2bVkeyIndex  *index.StringIDIndex
+	TaskPasswordIndex *index.StringIDIndex
+	PlatformUserIndex *index.StringIDIndex
+	UsernameIndex     *index.StringIDIndex
+}
+
+func init() {
+	hostIndexPtr.Store(HostIndex)
+	blake2bVkeyIndexPtr.Store(Blake2bVkeyIndex)
+	taskPasswordIndexPtr.Store(TaskPasswordIndex)
+	platformUserIndexPtr.Store(PlatformUserIndex)
+	usernameIndexPtr.Store(UsernameIndex)
+}
+
+func NewRuntimeIndexes() RuntimeIndexes {
+	return RuntimeIndexes{
+		HostIndex:         index.NewDomainIndex(),
+		Blake2bVkeyIndex:  index.NewStringIDIndex(),
+		TaskPasswordIndex: index.NewStringIDIndex(),
+		PlatformUserIndex: index.NewStringIDIndex(),
+		UsernameIndex:     index.NewStringIDIndex(),
+	}
+}
+
+func SnapshotRuntimeIndexes() RuntimeIndexes {
+	return RuntimeIndexes{
+		HostIndex:         runtimeHostIndex(),
+		Blake2bVkeyIndex:  runtimeBlake2bVkeyIndex(),
+		TaskPasswordIndex: runtimeTaskPasswordIndex(),
+		PlatformUserIndex: runtimePlatformUserIndex(),
+		UsernameIndex:     runtimeUsernameIndex(),
+	}
+}
+
+func ReplaceRuntimeIndexes(indexes RuntimeIndexes) RuntimeIndexes {
+	indexes = normalizeRuntimeIndexes(indexes)
+	previous := SnapshotRuntimeIndexes()
+
+	HostIndex = indexes.HostIndex
+	Blake2bVkeyIndex = indexes.Blake2bVkeyIndex
+	TaskPasswordIndex = indexes.TaskPasswordIndex
+	PlatformUserIndex = indexes.PlatformUserIndex
+	UsernameIndex = indexes.UsernameIndex
+
+	hostIndexPtr.Store(indexes.HostIndex)
+	blake2bVkeyIndexPtr.Store(indexes.Blake2bVkeyIndex)
+	taskPasswordIndexPtr.Store(indexes.TaskPasswordIndex)
+	platformUserIndexPtr.Store(indexes.PlatformUserIndex)
+	usernameIndexPtr.Store(indexes.UsernameIndex)
+
+	return previous
+}
+
+func normalizeRuntimeIndexes(indexes RuntimeIndexes) RuntimeIndexes {
+	if indexes.HostIndex == nil {
+		indexes.HostIndex = index.NewDomainIndex()
+	}
+	if indexes.Blake2bVkeyIndex == nil {
+		indexes.Blake2bVkeyIndex = index.NewStringIDIndex()
+	}
+	if indexes.TaskPasswordIndex == nil {
+		indexes.TaskPasswordIndex = index.NewStringIDIndex()
+	}
+	if indexes.PlatformUserIndex == nil {
+		indexes.PlatformUserIndex = index.NewStringIDIndex()
+	}
+	if indexes.UsernameIndex == nil {
+		indexes.UsernameIndex = index.NewStringIDIndex()
+	}
+	return indexes
+}
+
+func runtimeHostIndex() *index.DomainIndex {
+	if current := hostIndexPtr.Load(); current != nil {
+		return current
+	}
+	hostIndexPtr.Store(HostIndex)
+	return HostIndex
+}
+
+func CurrentHostIndex() *index.DomainIndex {
+	return runtimeHostIndex()
+}
+
+func runtimeBlake2bVkeyIndex() *index.StringIDIndex {
+	if current := blake2bVkeyIndexPtr.Load(); current != nil {
+		return current
+	}
+	blake2bVkeyIndexPtr.Store(Blake2bVkeyIndex)
+	return Blake2bVkeyIndex
+}
+
+func CurrentBlake2bVkeyIndex() *index.StringIDIndex {
+	return runtimeBlake2bVkeyIndex()
+}
+
+func runtimeTaskPasswordIndex() *index.StringIDIndex {
+	if current := taskPasswordIndexPtr.Load(); current != nil {
+		return current
+	}
+	taskPasswordIndexPtr.Store(TaskPasswordIndex)
+	return TaskPasswordIndex
+}
+
+func CurrentTaskPasswordIndex() *index.StringIDIndex {
+	return runtimeTaskPasswordIndex()
+}
+
+func runtimePlatformUserIndex() *index.StringIDIndex {
+	if current := platformUserIndexPtr.Load(); current != nil {
+		return current
+	}
+	platformUserIndexPtr.Store(PlatformUserIndex)
+	return PlatformUserIndex
+}
+
+func CurrentPlatformUserIndex() *index.StringIDIndex {
+	return runtimePlatformUserIndex()
+}
+
+func runtimeUsernameIndex() *index.StringIDIndex {
+	if current := usernameIndexPtr.Load(); current != nil {
+		return current
+	}
+	usernameIndexPtr.Store(UsernameIndex)
+	return UsernameIndex
+}
+
+func CurrentUsernameIndex() *index.StringIDIndex {
+	return runtimeUsernameIndex()
+}
+
+// ReplaceDb swaps the cached DB instance and marks lazy initialization as satisfied.
+// Passing nil clears the cached instance so GetDb can initialize it again on demand.
+func ReplaceDb(db *DbUtils) {
+	dbMu.Lock()
+	defer dbMu.Unlock()
+	Db = db
+	once = sync.Once{}
+	if db != nil {
+		once.Do(func() {})
+	}
+}
 
 // GetDb init data from file
 func GetDb() *DbUtils {
+	dbMu.RLock()
+	current := Db
+	dbMu.RUnlock()
+	if current != nil {
+		return current
+	}
+	dbMu.Lock()
+	defer dbMu.Unlock()
 	once.Do(func() {
 		jsonDb := NewJsonDb(common.GetRunPath())
-		jsonDb.LoadClientFromJsonFile()
-		jsonDb.LoadTaskFromJsonFile()
-		jsonDb.LoadHostFromJsonFile()
-		jsonDb.LoadGlobalFromJsonFile()
+		jsonDb.LoadUsers()
+		jsonDb.LoadClients()
+		jsonDb.LoadTasks()
+		jsonDb.LoadHosts()
+		jsonDb.LoadGlobal()
 		Db = &DbUtils{JsonDb: jsonDb}
 	})
 	return Db
 }
 
+func (s *DbUtils) Ready() bool {
+	return s != nil && s.JsonDb != nil
+}
+
+func (s *DbUtils) NextClientID() int {
+	if !s.Ready() {
+		return 0
+	}
+	return int(s.JsonDb.GetClientId())
+}
+
+func (s *DbUtils) NextUserID() int {
+	if !s.Ready() {
+		return 0
+	}
+	return int(s.JsonDb.GetUserId())
+}
+
+func (s *DbUtils) NextTaskID() int {
+	if !s.Ready() {
+		return 0
+	}
+	return int(s.JsonDb.GetTaskId())
+}
+
+func (s *DbUtils) NextHostID() int {
+	if !s.Ready() {
+		return 0
+	}
+	return int(s.JsonDb.GetHostId())
+}
+
+func (s *DbUtils) StoreUsers() {
+	if !s.Ready() {
+		return
+	}
+	s.JsonDb.StoreUsers()
+}
+
+func (s *DbUtils) StoreClients() {
+	if !s.Ready() {
+		return
+	}
+	s.JsonDb.StoreClients()
+}
+
+func (s *DbUtils) StoreTasks() {
+	if !s.Ready() {
+		return
+	}
+	s.JsonDb.StoreTasks()
+}
+
+func (s *DbUtils) StoreHosts() {
+	if !s.Ready() {
+		return
+	}
+	s.JsonDb.StoreHosts()
+}
+
+func (s *DbUtils) StoreGlobal() {
+	if !s.Ready() {
+		return
+	}
+	s.JsonDb.StoreGlobal()
+}
+
+func (s *DbUtils) RangeClients(fn func(*Client) bool) {
+	if !s.Ready() || fn == nil {
+		return
+	}
+	s.JsonDb.Clients.Range(func(key, value interface{}) bool {
+		if _, ok := key.(int); !ok {
+			s.JsonDb.Clients.CompareAndDelete(key, value)
+			return true
+		}
+		client, ok := value.(*Client)
+		if !ok || client == nil {
+			s.JsonDb.Clients.CompareAndDelete(key, value)
+			return true
+		}
+		return fn(client)
+	})
+}
+
+func (s *DbUtils) RangeUsers(fn func(*User) bool) {
+	if !s.Ready() || fn == nil {
+		return
+	}
+	s.JsonDb.Users.Range(func(key, value interface{}) bool {
+		if _, ok := key.(int); !ok {
+			s.JsonDb.Users.CompareAndDelete(key, value)
+			return true
+		}
+		user, ok := value.(*User)
+		if !ok || user == nil {
+			s.JsonDb.Users.CompareAndDelete(key, value)
+			return true
+		}
+		return fn(user)
+	})
+}
+
+func (s *DbUtils) RangeTasks(fn func(*Tunnel) bool) {
+	if !s.Ready() || fn == nil {
+		return
+	}
+	s.JsonDb.Tasks.Range(func(key, value interface{}) bool {
+		if _, ok := key.(int); !ok {
+			s.JsonDb.Tasks.CompareAndDelete(key, value)
+			return true
+		}
+		task, ok := value.(*Tunnel)
+		if !ok || task == nil {
+			s.JsonDb.Tasks.CompareAndDelete(key, value)
+			return true
+		}
+		return fn(task)
+	})
+}
+
+func (s *DbUtils) RangeHosts(fn func(*Host) bool) {
+	if !s.Ready() || fn == nil {
+		return
+	}
+	s.JsonDb.Hosts.Range(func(key, value interface{}) bool {
+		if _, ok := key.(int); !ok {
+			s.JsonDb.Hosts.CompareAndDelete(key, value)
+			return true
+		}
+		host, ok := value.(*Host)
+		if !ok || host == nil {
+			s.JsonDb.Hosts.CompareAndDelete(key, value)
+			return true
+		}
+		return fn(host)
+	})
+}
+
 func GetMapKeys(m *sync.Map, isSort bool, sortKey, order string) (keys []int) {
+	if m == nil {
+		return nil
+	}
 	if (sortKey == "InletFlow" || sortKey == "ExportFlow") && isSort {
 		return sortClientByKey(m, sortKey, order)
 	}
 	m.Range(func(key, value interface{}) bool {
-		keys = append(keys, key.(int))
+		id, ok := key.(int)
+		if !ok {
+			m.CompareAndDelete(key, value)
+			return true
+		}
+		keys = append(keys, id)
 		return true
 	})
 	sort.Ints(keys)
 	return
 }
 
-func (s *DbUtils) GetClientList(start, length int, search, sort, order string, clientId int) ([]*Client, int) {
-	list := make([]*Client, 0)
-	var cnt int
-	originLength := length
-	id := common.GetIntNoErrByStr(search)
-	keys := GetMapKeys(&s.JsonDb.Clients, true, sort, order)
-	for _, key := range keys {
-		if value, ok := s.JsonDb.Clients.Load(key); ok {
-			v := value.(*Client)
-			if v.NoDisplay {
-				continue
-			}
-			if clientId != 0 && clientId != v.Id {
-				continue
-			}
-			if search != "" && v.Id != id && !common.ContainsFold(v.VerifyKey, search) && !common.ContainsFold(v.Remark, search) {
-				continue
-			}
-			cnt++
-			if start--; start < 0 {
-				if originLength == 0 {
-					list = append(list, v)
-				} else if length--; length >= 0 {
-					list = append(list, v)
-				}
-			}
-		}
+func loadClientEntry(m *sync.Map, key interface{}) (*Client, bool) {
+	if m == nil {
+		return nil, false
 	}
-	return list, cnt
+	value, ok := m.Load(key)
+	if !ok {
+		return nil, false
+	}
+	client, ok := value.(*Client)
+	if !ok || client == nil {
+		m.CompareAndDelete(key, value)
+		return nil, false
+	}
+	return client, true
 }
 
-func (s *DbUtils) GetIdByVerifyKey(vKey, addr, localAddr string, hashFunc func(string) string) (id int, err error) {
-	var exist bool
-	s.JsonDb.Clients.Range(func(key, value interface{}) bool {
-		v := value.(*Client)
-		if hashFunc(v.VerifyKey) == vKey && v.Status && v.Id > 0 {
-			v.Addr = common.GetIpByAddr(addr)
-			v.LocalAddr = common.GetIpByAddr(localAddr)
-			id = v.Id
-			exist = true
-			return false
+func loadUserEntry(m *sync.Map, key interface{}) (*User, bool) {
+	if m == nil {
+		return nil, false
+	}
+	value, ok := m.Load(key)
+	if !ok {
+		return nil, false
+	}
+	user, ok := value.(*User)
+	if !ok || user == nil {
+		m.CompareAndDelete(key, value)
+		return nil, false
+	}
+	return user, true
+}
+
+func loadTaskEntry(m *sync.Map, key interface{}) (*Tunnel, bool) {
+	if m == nil {
+		return nil, false
+	}
+	value, ok := m.Load(key)
+	if !ok {
+		return nil, false
+	}
+	task, ok := value.(*Tunnel)
+	if !ok || task == nil {
+		m.CompareAndDelete(key, value)
+		return nil, false
+	}
+	return task, true
+}
+
+func loadHostEntry(m *sync.Map, key interface{}) (*Host, bool) {
+	if m == nil {
+		return nil, false
+	}
+	value, ok := m.Load(key)
+	if !ok {
+		return nil, false
+	}
+	host, ok := value.(*Host)
+	if !ok || host == nil {
+		m.CompareAndDelete(key, value)
+		return nil, false
+	}
+	return host, true
+}
+
+func resolveStoredClientRef(s *DbUtils, client *Client) (*Client, error) {
+	if s == nil || s.JsonDb == nil {
+		return nil, errors.New("db is nil")
+	}
+	if client == nil || client.Id == 0 {
+		return nil, errors.New("client is nil")
+	}
+	stored, err := s.GetClient(client.Id)
+	if err != nil {
+		return nil, err
+	}
+	return stored, nil
+}
+
+type clientFlowSortField uint8
+
+const (
+	clientFlowSortFieldInvalid clientFlowSortField = iota
+	clientFlowSortFieldInlet
+	clientFlowSortFieldExport
+)
+
+type clientFlowSortEntry struct {
+	id         int
+	inletFlow  int64
+	exportFlow int64
+}
+
+func resolveClientFlowSortField(sortKey string) clientFlowSortField {
+	switch sortKey {
+	case "InletFlow":
+		return clientFlowSortFieldInlet
+	case "ExportFlow":
+		return clientFlowSortFieldExport
+	default:
+		return clientFlowSortFieldInvalid
+	}
+}
+
+func (e clientFlowSortEntry) sortValue(field clientFlowSortField) int64 {
+	switch field {
+	case clientFlowSortFieldInlet:
+		return e.inletFlow
+	case clientFlowSortFieldExport:
+		return e.exportFlow
+	default:
+		return 0
+	}
+}
+
+func sortClientByKey(m *sync.Map, sortKey, order string) (res []int) {
+	if m == nil {
+		return nil
+	}
+	field := resolveClientFlowSortField(sortKey)
+	if field == clientFlowSortFieldInvalid {
+		return nil
+	}
+	entries := make([]clientFlowSortEntry, 0)
+	m.Range(func(key, value interface{}) bool {
+		if _, ok := key.(int); !ok {
+			m.CompareAndDelete(key, value)
+			return true
 		}
+		client, ok := value.(*Client)
+		if !ok || client == nil {
+			m.CompareAndDelete(key, value)
+			return true
+		}
+		inletFlow, exportFlow := flowSnapshot(client.Flow)
+		entries = append(entries, clientFlowSortEntry{
+			id:         client.Id,
+			inletFlow:  inletFlow,
+			exportFlow: exportFlow,
+		})
 		return true
 	})
-	if exist {
-		return
-	}
-	return 0, errors.New("not found")
-}
-
-func (s *DbUtils) GetClientIdByBlake2bVkey(vkey string) (id int, err error) {
-	var exist bool
-	id, exist = Blake2bVkeyIndex.Get(vkey)
-	if exist {
-		return
-	}
-	err = errors.New("can not find client")
-	return
-}
-
-func (s *DbUtils) GetClientIdByMd5Vkey(vkey string) (id int, err error) {
-	var exist bool
-	s.JsonDb.Clients.Range(func(key, value interface{}) bool {
-		v := value.(*Client)
-		if crypt.Md5(v.VerifyKey) == vkey {
-			exist = true
-			id = v.Id
-			return false
+	descending := order == "desc"
+	sort.Slice(entries, func(i, j int) bool {
+		left := entries[i].sortValue(field)
+		right := entries[j].sortValue(field)
+		if left == right {
+			return entries[i].id < entries[j].id
 		}
-		return true
+		if descending {
+			return left < right
+		}
+		return left > right
 	})
-	if exist {
-		return
+	res = make([]int, 0, len(entries))
+	for _, entry := range entries {
+		res = append(res, entry.id)
 	}
-	err = errors.New("can not find client")
-	return
-}
-
-func (s *DbUtils) NewTask(t *Tunnel) (err error) {
-	//s.JsonDb.Tasks.Range(func(key, value interface{}) bool {
-	//	v := value.(*Tunnel)
-	//	if (v.Mode == "secret" || v.Mode == "p2p") && (t.Mode == "secret" || t.Mode == "p2p") && v.Password == t.Password {
-	//		err = errors.New(fmt.Sprintf("secret mode keys %s must be unique", t.Password))
-	//		return false
-	//	}
-	//	return true
-	//})
-	//if err != nil {
-	//	return
-	//}
-	if (t.Mode == "secret" || t.Mode == "p2p") && t.Password == "" {
-		t.Password = crypt.GetRandomString(16, t.Id)
-	}
-
-	t.Flow = new(Flow)
-
-	if t.Password != "" {
-		for {
-			hash := crypt.Md5(t.Password)
-			if idxId, ok := TaskPasswordIndex.Get(hash); !ok || idxId == t.Id {
-				TaskPasswordIndex.Add(hash, t.Id)
-				break
-			}
-			t.Password = crypt.GetRandomString(16, t.Id)
-		}
-	}
-
-	switch t.Mode {
-	case "socks5":
-		t.Mode = "mixProxy"
-		t.HttpProxy = false
-		t.Socks5Proxy = true
-	case "httpProxy":
-		t.Mode = "mixProxy"
-		t.HttpProxy = true
-		t.Socks5Proxy = false
-	}
-	if t.TargetType != common.CONN_TCP && t.TargetType != common.CONN_UDP {
-		t.TargetType = common.CONN_ALL
-	}
-	t.CompileDestACL()
-	s.JsonDb.Tasks.Store(t.Id, t)
-	s.JsonDb.StoreTasksToJsonFile()
-	return
-}
-
-func (s *DbUtils) UpdateTask(t *Tunnel) error {
-	if (t.Mode == "secret" || t.Mode == "p2p") && t.Password == "" {
-		t.Password = crypt.GetRandomString(16, t.Id)
-	}
-
-	if v, ok := s.JsonDb.Tasks.Load(t.Id); ok {
-		if oldPwd := v.(*Tunnel).Password; oldPwd != "" {
-			if idxId, ok := TaskPasswordIndex.Get(crypt.Md5(oldPwd)); ok && idxId == t.Id {
-				TaskPasswordIndex.Remove(crypt.Md5(oldPwd))
-			}
-		}
-	}
-
-	if t.Password != "" {
-		for {
-			hash := crypt.Md5(t.Password)
-			if idxId, ok := TaskPasswordIndex.Get(hash); !ok || idxId == t.Id {
-				TaskPasswordIndex.Add(hash, t.Id)
-				break
-			}
-			t.Password = crypt.GetRandomString(16, t.Id)
-		}
-	}
-	switch t.Mode {
-	case "socks5":
-		t.Mode = "mixProxy"
-		t.HttpProxy = false
-		t.Socks5Proxy = true
-	case "httpProxy":
-		t.Mode = "mixProxy"
-		t.HttpProxy = true
-		t.Socks5Proxy = false
-	}
-	if t.TargetType != common.CONN_TCP && t.TargetType != common.CONN_UDP {
-		t.TargetType = common.CONN_ALL
-	}
-	t.CompileDestACL()
-	s.JsonDb.Tasks.Store(t.Id, t)
-	s.JsonDb.StoreTasksToJsonFile()
-	return nil
+	return res
 }
 
 func (s *DbUtils) SaveGlobal(t *Glob) error {
+	if t == nil {
+		t = &Glob{}
+	}
+	InitializeGlobalRuntime(t)
 	s.JsonDb.Global = t
-	s.JsonDb.StoreGlobalToJsonFile()
+	s.JsonDb.StoreGlobal()
 	return nil
-}
-
-func (s *DbUtils) DelTask(id int) error {
-	if v, ok := s.JsonDb.Tasks.Load(id); ok {
-		t := v.(*Tunnel)
-		TaskPasswordIndex.Remove(crypt.Md5(t.Password))
-	}
-	s.JsonDb.Tasks.Delete(id)
-	s.JsonDb.StoreTasksToJsonFile()
-	return nil
-}
-
-// GetTaskByMd5Password md5 password
-func (s *DbUtils) GetTaskByMd5Password(p string) (t *Tunnel) {
-	id, ok := TaskPasswordIndex.Get(p)
-	if ok {
-		if v, ok := s.JsonDb.Tasks.Load(id); ok {
-			t = v.(*Tunnel)
-			return
-		}
-	}
-	return
-}
-
-func (s *DbUtils) GetTaskByMd5PasswordOld(p string) (t *Tunnel) {
-	s.JsonDb.Tasks.Range(func(key, value interface{}) bool {
-		if crypt.Md5(value.(*Tunnel).Password) == p {
-			t = value.(*Tunnel)
-			return false
-		}
-		return true
-	})
-	return
-}
-
-func (s *DbUtils) GetTask(id int) (t *Tunnel, err error) {
-	if v, ok := s.JsonDb.Tasks.Load(id); ok {
-		t = v.(*Tunnel)
-		return
-	}
-	err = errors.New("not found")
-	return
-}
-
-func (s *DbUtils) DelHost(id int) error {
-	if v, ok := s.JsonDb.Hosts.Load(id); ok {
-		h := v.(*Host)
-		HostIndex.Remove(h.Host, id)
-	}
-	s.JsonDb.Hosts.Delete(id)
-	s.JsonDb.StoreHostToJsonFile()
-	return nil
-}
-
-func (s *DbUtils) IsHostExist(h *Host) bool {
-	var exist bool
-	if h.Location == "" {
-		h.Location = "/"
-	}
-	s.JsonDb.Hosts.Range(func(key, value interface{}) bool {
-		v := value.(*Host)
-		if v.Location == "" {
-			v.Location = "/"
-		}
-		if v.Id != h.Id && v.Host == h.Host && h.Location == v.Location && (v.Scheme == "all" || v.Scheme == h.Scheme) {
-			exist = true
-			return false
-		}
-		return true
-	})
-	return exist
-}
-
-func (s *DbUtils) IsHostModify(h *Host) bool {
-	if h == nil {
-		return true
-	}
-
-	existingHost, err := s.GetHostById(h.Id)
-	if err != nil {
-		return true
-	}
-
-	if existingHost.IsClose != h.IsClose ||
-		existingHost.Host != h.Host ||
-		existingHost.Location != h.Location ||
-		existingHost.Scheme != h.Scheme ||
-		existingHost.HttpsJustProxy != h.HttpsJustProxy ||
-		existingHost.CertFile != h.CertFile ||
-		existingHost.KeyFile != h.KeyFile {
-		return true
-	}
-
-	return false
-}
-
-func (s *DbUtils) NewHost(t *Host) error {
-	if t.Location == "" {
-		t.Location = "/"
-	}
-	if t.Scheme != "all" && t.Scheme != "http" && t.Scheme != "https" {
-		t.Scheme = "all"
-	}
-	if s.IsHostExist(t) {
-		return errors.New("host has exist")
-	}
-	HostIndex.Add(t.Host, t.Id)
-	t.CertType = common.GetCertType(t.CertFile)
-	t.CertHash = crypt.FNV1a64(t.CertType, t.CertFile, t.KeyFile)
-	t.Flow = new(Flow)
-	s.JsonDb.Hosts.Store(t.Id, t)
-	s.JsonDb.StoreHostToJsonFile()
-	return nil
-}
-
-func (s *DbUtils) GetHost(start, length int, id int, search string) ([]*Host, int) {
-	list := make([]*Host, 0)
-	var cnt int
-	originLength := length
-	searchId := common.GetIntNoErrByStr(search)
-	keys := GetMapKeys(&s.JsonDb.Hosts, false, "", "")
-	for _, key := range keys {
-		if value, ok := s.JsonDb.Hosts.Load(key); ok {
-			v := value.(*Host)
-			if search != "" && v.Id != searchId && !common.ContainsFold(v.Host, search) && !common.ContainsFold(v.Remark, search) && !common.ContainsFold(v.Client.VerifyKey, search) {
-				continue
-			}
-			if id == 0 || v.Client.Id == id {
-				cnt++
-				if start--; start < 0 {
-					if originLength == 0 {
-						list = append(list, v)
-					} else if length--; length >= 0 {
-						list = append(list, v)
-					}
-				}
-			}
-		}
-	}
-	return list, cnt
-}
-
-func (s *DbUtils) DelClient(id int) error {
-	if v, ok := s.JsonDb.Clients.Load(id); ok {
-		c := v.(*Client)
-		Blake2bVkeyIndex.Remove(crypt.Blake2b(c.VerifyKey))
-		if c.Rate != nil {
-			c.Rate.Stop()
-		}
-	}
-	s.JsonDb.Clients.Delete(id)
-	s.JsonDb.StoreClientsToJsonFile()
-	return nil
-}
-
-func (s *DbUtils) NewClient(c *Client) error {
-	var isNotSet bool
-	if c.WebUserName != "" && !s.VerifyUserName(c.WebUserName, c.Id) {
-		return errors.New("web login username duplicate, please reset")
-	}
-	c.EnsureWebPassword()
-reset:
-	if c.VerifyKey == "" || isNotSet {
-		isNotSet = true
-		c.VerifyKey = crypt.GetRandomString(16, c.Id)
-	}
-	if !s.VerifyVkey(c.VerifyKey, c.Id) {
-		if isNotSet {
-			goto reset
-		}
-		return errors.New("vkey duplicate, please reset")
-	}
-	if c.RateLimit == 0 {
-		c.Rate = rate.NewRate(0)
-	} else if c.Rate == nil {
-		c.Rate = rate.NewRate(int64(c.RateLimit) * 1024)
-	}
-	c.Rate.Start()
-	if c.Id == 0 {
-		c.Id = int(s.JsonDb.GetClientId())
-	}
-	if c.Flow == nil {
-		c.Flow = new(Flow)
-	}
-	s.JsonDb.Clients.Store(c.Id, c)
-	Blake2bVkeyIndex.Add(crypt.Blake2b(c.VerifyKey), c.Id)
-	s.JsonDb.StoreClientsToJsonFile()
-	return nil
-}
-
-func (s *DbUtils) VerifyVkey(vkey string, id int) (res bool) {
-	res = true
-	s.JsonDb.Clients.Range(func(key, value interface{}) bool {
-		v := value.(*Client)
-		if v.VerifyKey == vkey && v.Id != id {
-			res = false
-			return false
-		}
-		return true
-	})
-	return res
-}
-
-func (s *DbUtils) VerifyUserName(username string, id int) (res bool) {
-	res = true
-	s.JsonDb.Clients.Range(func(key, value interface{}) bool {
-		v := value.(*Client)
-		if v.WebUserName == username && v.Id != id {
-			res = false
-			return false
-		}
-		return true
-	})
-	return res
-}
-
-func (s *DbUtils) UpdateClient(t *Client) error {
-	if v, ok := s.JsonDb.Clients.Load(t.Id); ok {
-		c := v.(*Client)
-		Blake2bVkeyIndex.Remove(crypt.Blake2b(c.VerifyKey))
-		if t.Rate == nil {
-			t.Rate = c.Rate
-		}
-	}
-
-	s.JsonDb.Clients.Store(t.Id, t)
-	Blake2bVkeyIndex.Add(crypt.Blake2b(t.VerifyKey), t.Id)
-	var limit int64
-	if t.RateLimit > 0 {
-		limit = int64(t.RateLimit) * 1024
-	} else {
-		limit = 0
-	}
-	if t.Rate != nil {
-		if t.Rate.Limit() != limit {
-			t.Rate.ResetLimit(limit)
-		} else {
-			t.Rate.Start()
-		}
-	} else {
-		t.Rate = rate.NewRate(limit)
-		t.Rate.Start()
-	}
-	return nil
-}
-
-func (s *DbUtils) IsPubClient(id int) bool {
-	client, err := s.GetClient(id)
-	if err == nil {
-		return client.NoDisplay
-	}
-	return false
-}
-
-func (s *DbUtils) GetClient(id int) (c *Client, err error) {
-	if v, ok := s.JsonDb.Clients.Load(id); ok {
-		c = v.(*Client)
-		return
-	}
-	err = errors.New("can not find client")
-	return
 }
 
 func (s *DbUtils) GetGlobal() (c *Glob) {
 	return s.JsonDb.Global
 }
 
-func (s *DbUtils) GetHostById(id int) (h *Host, err error) {
-	if v, ok := s.JsonDb.Hosts.Load(id); ok {
-		h = v.(*Host)
+func (s *DbUtils) WithDeferredPersistence(run func() error) error {
+	if run == nil {
+		return nil
+	}
+	if s == nil || s.JsonDb == nil {
+		return run()
+	}
+	return s.JsonDb.WithDeferredPersistence(run)
+}
+
+func (s *DbUtils) FlushToDisk() {
+	if s == nil || s.JsonDb == nil {
 		return
 	}
-	err = errors.New("the host could not be parsed")
-	return
-}
-
-// GetInfoByHost get key by host from x
-func (s *DbUtils) GetInfoByHost(host string, r *http.Request) (h *Host, err error) {
-	host = common.GetIpByAddr(host)
-	hostLength := len(host)
-
-	requestPath := r.RequestURI
-	if requestPath == "" {
-		requestPath = "/"
-	}
-
-	scheme := r.URL.Scheme
-
-	ids := HostIndex.Lookup(host)
-	if len(ids) == 0 {
-		return nil, errors.New("the host could not be parsed")
-	}
-
-	var bestMatch *Host
-	var bestDomainLength int
-	var bestLocationLength int
-	for _, id := range ids {
-		value, ok := s.JsonDb.Hosts.Load(id)
-		if !ok {
-			continue
-		}
-		v := value.(*Host)
-
-		if v.IsClose || (v.Scheme != "all" && v.Scheme != scheme) {
-			continue
-		}
-
-		curDomainLength := len(strings.TrimPrefix(v.Host, "*"))
-		if hostLength < curDomainLength {
-			continue
-		}
-
-		equaled := v.Host == host
-		matched := equaled || (strings.HasPrefix(v.Host, "*") && strings.HasSuffix(host, v.Host[1:]))
-		if !matched {
-			continue
-		}
-
-		location := v.Location
-		if location == "" {
-			location = "/"
-		}
-
-		if !strings.HasPrefix(requestPath, location) {
-			continue
-		}
-
-		curLocationLength := len(location)
-		if bestMatch == nil {
-			bestMatch = v
-			bestDomainLength = curDomainLength
-			bestLocationLength = curLocationLength
-			continue
-		}
-		if curLocationLength > bestLocationLength {
-			bestMatch = v
-			bestDomainLength = curDomainLength
-			bestLocationLength = curLocationLength
-			continue
-		}
-		if curLocationLength == bestLocationLength {
-			if curDomainLength > bestDomainLength {
-				bestMatch = v
-				bestDomainLength = curDomainLength
-				bestLocationLength = curLocationLength
-				continue
-			}
-			if equaled {
-				bestMatch = v
-				bestDomainLength = curDomainLength
-				bestLocationLength = curLocationLength
-				continue
-			}
-		}
-	}
-
-	if bestMatch != nil {
-		return bestMatch, nil
-	}
-	return nil, errors.New("the host could not be parsed")
-}
-
-func (s *DbUtils) FindCertByHost(host string) (*Host, error) {
-	if host == "" {
-		return nil, errors.New("invalid Host")
-	}
-
-	host = common.GetIpByAddr(host)
-	hostLength := len(host)
-
-	ids := HostIndex.Lookup(host)
-	if len(ids) == 0 {
-		return nil, errors.New("the host could not be parsed")
-	}
-
-	var bestMatch *Host
-	var bestDomainLength int
-	for _, id := range ids {
-		value, ok := s.JsonDb.Hosts.Load(id)
-		if !ok {
-			continue
-		}
-		v := value.(*Host)
-
-		if v.IsClose || (v.Scheme == "http") {
-			continue
-		}
-
-		curDomainLength := len(strings.TrimPrefix(v.Host, "*"))
-		if hostLength < curDomainLength {
-			continue
-		}
-
-		equaled := v.Host == host
-		matched := false
-		location := v.Location == "/" || v.Location == ""
-		if equaled {
-			if location {
-				bestMatch = v
-				break
-			}
-			matched = true
-		} else if strings.HasPrefix(v.Host, "*") && strings.HasSuffix(host, v.Host[1:]) {
-			matched = true
-		}
-		if !matched {
-			continue
-		}
-
-		if bestMatch == nil {
-			bestMatch = v
-			bestDomainLength = curDomainLength
-			continue
-		}
-		if curDomainLength > bestDomainLength {
-			bestMatch = v
-			bestDomainLength = curDomainLength
-			continue
-		}
-		if curDomainLength == bestDomainLength {
-			if equaled && (len(v.Location) <= len(bestMatch.Location) || strings.HasPrefix(bestMatch.Host, "*")) {
-				bestMatch = v
-				bestDomainLength = curDomainLength
-				continue
-			}
-			if (len(v.Location) <= len(bestMatch.Location)) && strings.HasPrefix(bestMatch.Host, "*") {
-				bestMatch = v
-				bestDomainLength = curDomainLength
-				continue
-			}
-		}
-	}
-	if bestMatch != nil {
-		return bestMatch, nil
-	}
-	return nil, errors.New("the host could not be parsed")
+	s.JsonDb.storeUsersNow()
+	s.JsonDb.storeClientsNow()
+	s.JsonDb.storeTasksNow()
+	s.JsonDb.storeHostsNow()
+	s.JsonDb.storeGlobalNow()
 }

@@ -73,7 +73,7 @@ func IsTrustedProxy(list, ipStr string) bool {
 		if entry == "*" {
 			return true
 		}
-		// CIDR（IPv4/IPv6）
+		// CIDR (IPv4/IPv6)
 		if strings.Contains(entry, "/") {
 			if _, cidr, err := net.ParseCIDR(entry); err == nil && cidr.Contains(ip) {
 				return true

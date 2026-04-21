@@ -40,12 +40,6 @@ func init() {
 	mustRegisterViperFormat("json", ".json")
 }
 
-func mustRegisterFormat(format string, parser parserFunc, extensions ...string) {
-	if err := RegisterFormat(format, parser, extensions...); err != nil {
-		panic(err)
-	}
-}
-
 func mustRegisterViperFormat(format string, extensions ...string) {
 	if err := RegisterViperFormat(format, extensions...); err != nil {
 		panic(err)
@@ -76,15 +70,25 @@ func RegisterFormat(format string, parser parserFunc, extensions ...string) erro
 	if _, exists := parsers[format]; exists {
 		return fmt.Errorf("config format %q already registered", format)
 	}
-	parsers[format] = parser
+	normalizedExtensions := make([]string, 0, len(extensions))
+	pending := make(map[string]struct{}, len(extensions))
 	for _, ext := range extensions {
 		normalized := normalizeExt(ext)
 		if normalized == "" {
 			return fmt.Errorf("config format %q has invalid extension %q", format, ext)
 		}
+		if _, exists := pending[normalized]; exists {
+			return fmt.Errorf("config format %q declares duplicate extension %q", format, normalized)
+		}
 		if owner, exists := extensionFormats[normalized]; exists {
 			return fmt.Errorf("config extension %q already registered by %q", normalized, owner)
 		}
+		pending[normalized] = struct{}{}
+		normalizedExtensions = append(normalizedExtensions, normalized)
+	}
+
+	parsers[format] = parser
+	for _, normalized := range normalizedExtensions {
 		extensionFormats[normalized] = format
 		extensionOrder = append(extensionOrder, normalized)
 	}
@@ -226,6 +230,7 @@ func Load(path string) error {
 	if err != nil {
 		return fmt.Errorf("parse %s config %s: %w", format, path, err)
 	}
+	values = normalizeConfigValues(values)
 	snapshot := buildSnapshot(values)
 
 	mu.Lock()
@@ -300,6 +305,39 @@ func normalizeKey(key string) string {
 		return r == '_' || r == '.' || r == '-' || unicode.IsSpace(r)
 	})
 	return strings.Join(parts, "_")
+}
+
+func normalizeBaseURL(raw string) string {
+	raw = strings.TrimSpace(strings.ReplaceAll(raw, "\\", "/"))
+	if raw == "" || raw == "/" {
+		return ""
+	}
+	segments := make([]string, 0, strings.Count(raw, "/")+1)
+	for _, segment := range strings.Split(raw, "/") {
+		segment = strings.TrimSpace(segment)
+		if segment == "" {
+			continue
+		}
+		segments = append(segments, segment)
+	}
+	if len(segments) == 0 {
+		return ""
+	}
+	return "/" + strings.Join(segments, "/")
+}
+
+func NormalizeBaseURL(raw string) string {
+	return normalizeBaseURL(raw)
+}
+
+func normalizeConfigValues(values map[string]any) map[string]any {
+	if values == nil {
+		return values
+	}
+	if raw, ok := values["web_base_url"]; ok {
+		values["web_base_url"] = normalizeBaseURL(stringifyValue(raw))
+	}
+	return values
 }
 
 func joinKey(parts ...string) string {

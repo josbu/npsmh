@@ -1,18 +1,20 @@
 package file
 
 import (
-	"errors"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/djylb/nps/lib/common"
-	"github.com/djylb/nps/lib/crypt"
+	"github.com/djylb/nps/lib/policy"
 	"github.com/djylb/nps/lib/rate"
 )
 
-// ACLMode: 0=off, 1=whitelist(deny-by-default), 2=blacklist(allow-by-default)
+var (
+	clientSetupHookMu sync.RWMutex
+	clientSetupHook   func(*Client)
+)
+
 const (
 	AclOff       = 0
 	AclWhitelist = 1
@@ -20,329 +22,157 @@ const (
 )
 
 type Flow struct {
-	ExportFlow int64     // outbound traffic
-	InletFlow  int64     // inbound traffic
-	FlowLimit  int64     // traffic limit
-	TimeLimit  time.Time // expire time
+	ExportFlow int64
+	InletFlow  int64
+	FlowLimit  int64
+	TimeLimit  time.Time
+	onDelta    func(in, out int64)
 	sync.RWMutex
 }
 
-func (s *Flow) Add(in, out int64) {
-	s.Lock()
-	s.InletFlow += in
-	s.ExportFlow += out
-	s.Unlock()
+type TrafficStats struct {
+	ExportBytes int64 `json:"export_bytes"`
+	InletBytes  int64 `json:"inlet_bytes"`
 }
 
-func (s *Flow) Sub(in, out int64) {
-	s.Lock()
-	s.InletFlow -= in
-	s.ExportFlow -= out
-	if s.InletFlow < 0 {
-		s.InletFlow = 0
-	}
-	if s.ExportFlow < 0 {
-		s.ExportFlow = 0
-	}
-	s.Unlock()
+type User struct {
+	Id                 int
+	Username           string
+	Password           string
+	TOTPSecret         string
+	Kind               string
+	ExternalPlatformID string
+	Hidden             bool
+	Status             int
+	ExpireAt           int64
+	FlowLimit          int64
+	TotalFlow          *Flow
+	MaxClients         int
+	MaxTunnels         int
+	MaxHosts           int
+	MaxConnections     int
+	RateLimit          int
+	EntryAclMode       int
+	EntryAclRules      string
+	DestAclMode        int
+	DestAclRules       string
+	Revision           int64
+	UpdatedAt          int64
+	ExpectedRevision   int64      `json:"-"`
+	NowConn            int32      `json:"-"`
+	Rate               *rate.Rate `json:"-"`
+	TotalTraffic       *TrafficStats
+	TotalMeter         *rate.Meter `json:"-"`
+	sourcePolicy       *policy.SourceIPPolicy
+	destIPPolicy       *policy.SourceIPPolicy
+	destPolicy         *policy.DestinationPolicy
+	sync.RWMutex
 }
 
 type Config struct {
-	U        string // username
-	P        string // password
+	U        string
+	P        string
 	Compress bool
 	Crypt    bool
 }
 
 type Client struct {
-	Cnf             *Config
-	Id              int        // id
-	VerifyKey       string     // verify key
-	Mode            string     // bridge mode
-	Addr            string     // client ip
-	LocalAddr       string     // client local ip
-	Remark          string     // remark
-	Status          bool       // allowed to connect
-	IsConnect       bool       // connected now
-	RateLimit       int        // rate limit (KB/s)
-	Flow            *Flow      // flow
-	ExportFlow      int64      // outbound flow
-	InletFlow       int64      // inbound flow
-	Rate            *rate.Rate // rate limiter
-	NoStore         bool       // do not store to file
-	NoDisplay       bool       // do not display on web
-	MaxConn         int        // max concurrent connections
-	NowConn         int32      // current connections
-	WebUserName     string     // web username
-	WebPassword     string     // web password
-	WebTotpSecret   string     // web totp secret
-	ConfigConnAllow bool       // allowed by config file
-	MaxTunnelNum    int
-	Version         string
-	BlackIpList     []string
-	CreateTime      string
-	LastOnlineTime  string
+	Cnf               *Config
+	Id                int
+	UserId            int
+	OwnerUserID       int
+	ManagerUserIDs    []int
+	SourceType        string
+	SourcePlatformID  string
+	SourceActorID     string
+	Revision          int64
+	UpdatedAt         int64
+	ExpectedRevision  int64 `json:"-"`
+	VerifyKey         string
+	Mode              string
+	Addr              string
+	LocalAddr         string
+	Remark            string
+	Status            bool
+	IsConnect         bool
+	ExpireAt          int64
+	FlowLimit         int64
+	RateLimit         int
+	Flow              *Flow
+	ExportFlow        int64
+	InletFlow         int64
+	Rate              *rate.Rate `json:"-"`
+	BridgeTraffic     *TrafficStats
+	ServiceTraffic    *TrafficStats
+	BridgeMeter       *rate.Meter `json:"-"`
+	ServiceMeter      *rate.Meter `json:"-"`
+	TotalMeter        *rate.Meter `json:"-"`
+	NoStore           bool
+	NoDisplay         bool
+	MaxConn           int
+	NowConn           int32
+	ConfigConnAllow   bool
+	MaxTunnelNum      int
+	Version           string
+	EntryAclMode      int
+	EntryAclRules     string
+	CreateTime        string
+	LastOnlineTime    string
+	legacyBlackIPList []string
+	legacyWebLogin    *legacyClientWebLoginImport
+	sourcePolicy      *policy.SourceIPPolicy
+	ownerUser         *User
 	sync.RWMutex
-}
-
-func NewClient(vKey string, noStore bool, noDisplay bool) *Client {
-	return &Client{
-		Cnf:       new(Config),
-		Id:        0,
-		VerifyKey: vKey,
-		Addr:      "",
-		Remark:    "",
-		Status:    true,
-		IsConnect: false,
-		RateLimit: 0,
-		Flow:      new(Flow),
-		Rate:      nil,
-		NoStore:   noStore,
-		RWMutex:   sync.RWMutex{},
-		NoDisplay: noDisplay,
-	}
-}
-
-func (s *Client) AddConn() {
-	atomic.AddInt32(&s.NowConn, 1)
-}
-
-func (s *Client) CutConn() {
-	atomic.AddInt32(&s.NowConn, -1)
-}
-
-func (s *Client) GetConn() bool {
-	if s.NowConn < 0 {
-		s.NowConn = 0
-	}
-	if s.MaxConn == 0 || int(s.NowConn) < s.MaxConn {
-		s.AddConn()
-		return true
-	}
-	return false
-}
-
-func (s *Client) HasTunnel(t *Tunnel) (tt *Tunnel, exist bool) {
-	GetDb().JsonDb.Tasks.Range(func(key, value interface{}) bool {
-		v := value.(*Tunnel)
-		if v.Client.Id == s.Id && ((v.Port == t.Port && t.Port != 0) || (v.Password == t.Password && t.Password != "")) {
-			exist = true
-			tt = v
-			return false
-		}
-		return true
-	})
-	return
-}
-
-func (s *Client) GetTunnelNum() (num int) {
-	GetDb().JsonDb.Tasks.Range(func(key, value interface{}) bool {
-		v := value.(*Tunnel)
-		if v.Client.Id == s.Id {
-			num++
-		}
-		return true
-	})
-
-	GetDb().JsonDb.Hosts.Range(func(key, value interface{}) bool {
-		v := value.(*Host)
-		if v.Client.Id == s.Id {
-			num++
-		}
-		return true
-	})
-	return
-}
-
-func (s *Client) HasHost(h *Host) (hh *Host, exist bool) {
-	GetDb().JsonDb.Hosts.Range(func(key, value interface{}) bool {
-		v := value.(*Host)
-		if v.Client.Id == s.Id && v.Host == h.Host && h.Location == v.Location {
-			exist = true
-			hh = v
-			return false
-		}
-		return true
-	})
-	return
-}
-
-func (s *Client) EnsureWebPassword() {
-	if s.WebTotpSecret != "" {
-		if !crypt.IsValidTOTPSecret(s.WebTotpSecret) {
-			s.WebTotpSecret, _ = crypt.GenerateTOTPSecret()
-		}
-	}
-	if idx := strings.LastIndex(s.WebPassword, common.TOTP_SEQ); idx != -1 {
-		secret := s.WebPassword[idx+len(common.TOTP_SEQ):]
-		s.WebPassword = s.WebPassword[:idx]
-		if !crypt.IsValidTOTPSecret(secret) {
-			secret, _ = crypt.GenerateTOTPSecret()
-		}
-		s.WebTotpSecret = secret
-	}
 }
 
 type Tunnel struct {
-	Id           int
-	Port         int
-	ServerIp     string
-	Mode         string
-	Status       bool
-	RunStatus    bool
-	Client       *Client
-	Ports        string
-	Flow         *Flow
-	NowConn      int32
-	Password     string
-	Remark       string
-	TargetAddr   string
-	TargetType   string
-	DestAclMode  int              // 0=off, 1=whitelist, 2=blacklist
-	DestAclRules string           // raw rules text
-	DestAclSet   *common.ProxyACL `json:"-"`
-	NoStore      bool
-	IsHttp       bool
-	HttpProxy    bool
-	Socks5Proxy  bool
-	LocalPath    string
-	StripPre     string
-	ReadOnly     bool
-	Target       *Target
-	UserAuth     *MultiAccount
-	MultiAccount *MultiAccount
+	Id               int
+	Revision         int64
+	UpdatedAt        int64
+	ExpectedRevision int64 `json:"-"`
+	Port             int
+	ServerIp         string
+	Mode             string
+	Status           bool
+	RunStatus        bool
+	Client           *Client
+	Ports            string
+	ExpireAt         int64
+	FlowLimit        int64
+	RateLimit        int
+	Flow             *Flow
+	Rate             *rate.Rate `json:"-"`
+	ServiceTraffic   *TrafficStats
+	ServiceMeter     *rate.Meter `json:"-"`
+	MaxConn          int
+	NowConn          int32
+	Password         string
+	Remark           string
+	TargetAddr       string
+	TargetType       string
+	EntryAclMode     int
+	EntryAclRules    string
+	entryPolicy      *policy.SourceIPPolicy
+	DestAclMode      int
+	DestAclRules     string
+	DestAclSet       *policy.DestinationPolicy `json:"-"`
+	destIPPolicy     *policy.SourceIPPolicy
+	destPolicy       *policy.DestinationPolicy
+	NoStore          bool
+	IsHttp           bool
+	HttpProxy        bool
+	Socks5Proxy      bool
+	LocalPath        string
+	StripPre         string
+	ReadOnly         bool
+	Target           *Target
+	UserAuth         *MultiAccount
+	MultiAccount     *MultiAccount
 	Health
+	runtimeRouteUUID   string
+	runtimeOwners      *runtimeOwnerPool[*Tunnel]
+	runtimeConnCounter *int32
 	sync.RWMutex
-}
-
-func (t *Tunnel) CompileDestACL() {
-	if t == nil {
-		return
-	}
-
-	t.Lock()
-	defer t.Unlock()
-
-	// Invalid mode => off
-	if t.DestAclMode != AclOff && t.DestAclMode != AclWhitelist && t.DestAclMode != AclBlacklist {
-		t.DestAclMode = AclOff
-	}
-
-	// Normalize rules (store normalized form)
-	t.DestAclRules = strings.ToLower(strings.TrimSpace(strings.ReplaceAll(t.DestAclRules, "\r\n", "\n")))
-
-	if t.DestAclMode == AclOff {
-		t.DestAclSet = nil
-		return
-	}
-
-	// Semantics:
-	// - whitelist + empty rules => deny all
-	// - blacklist + empty rules => allow all
-	if t.DestAclRules == "" {
-		if t.DestAclMode == AclWhitelist {
-			t.DestAclSet = &common.ProxyACL{} // empty => never match => deny all
-		} else {
-			t.DestAclSet = nil // allow all
-		}
-		return
-	}
-
-	t.DestAclSet = common.ParseProxyACL(t.DestAclRules)
-}
-
-func (t *Tunnel) AllowsDestination(addr string) bool {
-	if t == nil {
-		return true
-	}
-
-	t.RLock()
-	mode := t.DestAclMode
-	rules := t.DestAclRules
-	set := t.DestAclSet
-	t.RUnlock()
-
-	if mode != AclOff && mode != AclWhitelist && mode != AclBlacklist {
-		mode = AclOff
-	}
-
-	if mode == AclOff {
-		return true
-	}
-
-	// If not compiled (should be compiled at load/new/update), fall back safely.
-	if set == nil {
-		if rules == "" {
-			return mode == AclBlacklist
-		}
-		// Compile once on-demand (rare path)
-		t.CompileDestACL()
-		t.RLock()
-		mode = t.DestAclMode
-		//rules = t.DestAclRules
-		set = t.DestAclSet
-		t.RUnlock()
-
-		if mode == AclOff {
-			return true
-		}
-
-		// if still nil:
-		// - whitelist => deny all
-		// - blacklist => allow all
-		if set == nil {
-			return mode == AclBlacklist
-		}
-	}
-
-	matched := set.Allows(addr)
-	if mode == AclWhitelist {
-		return matched
-	}
-	// blacklist
-	return !matched
-}
-
-func NewTunnelByHost(host *Host, port int) *Tunnel {
-	return &Tunnel{
-		ServerIp:     "0.0.0.0",
-		Port:         port,
-		Mode:         "tcp",
-		Status:       !host.IsClose,
-		RunStatus:    !host.IsClose,
-		Client:       host.Client,
-		Flow:         host.Flow,
-		NoStore:      true,
-		Target:       host.Target,
-		UserAuth:     host.UserAuth,
-		MultiAccount: host.MultiAccount,
-	}
-}
-
-func (t *Tunnel) Update(other *Tunnel) {
-	t.ServerIp = other.ServerIp
-	t.Mode = other.Mode
-	t.Password = other.Password
-	t.Remark = other.Remark
-	t.TargetType = other.TargetType
-	t.HttpProxy = other.HttpProxy
-	t.Socks5Proxy = other.Socks5Proxy
-	t.DestAclMode = other.DestAclMode
-	t.DestAclRules = other.DestAclRules
-	t.DestAclSet = other.DestAclSet
-	t.LocalPath = other.LocalPath
-	t.StripPre = other.StripPre
-	t.ReadOnly = other.ReadOnly
-	t.Target = other.Target
-	t.MultiAccount = other.MultiAccount
-}
-
-func (t *Tunnel) AddConn() {
-	atomic.AddInt32(&t.NowConn, 1)
-}
-
-func (t *Tunnel) CutConn() {
-	atomic.AddInt32(&t.NowConn, -1)
 }
 
 type Health struct {
@@ -359,123 +189,276 @@ type Health struct {
 }
 
 type Host struct {
-	Id               int
-	Host             string // host
-	HeaderChange     string // request header change
-	RespHeaderChange string // response header change
-	HostChange       string // host change
-	Location         string // url router
-	PathRewrite      string // url rewrite
-	Remark           string // remark
-	Scheme           string // http/https/all
-	RedirectURL      string // 307
-	HttpsJustProxy   bool
-	TlsOffload       bool
-	AutoSSL          bool
-	CertType         string
-	CertHash         string
-	CertFile         string
-	KeyFile          string
-	NoStore          bool
-	IsClose          bool
-	AutoHttps        bool
-	AutoCORS         bool
-	CompatMode       bool
-	Flow             *Flow
-	NowConn          int32
-	Client           *Client
-	TargetIsHttps    bool
-	Target           *Target
-	UserAuth         *MultiAccount
-	MultiAccount     *MultiAccount
-	Health           `json:"-"`
+	Id                 int
+	Revision           int64
+	UpdatedAt          int64
+	ExpectedRevision   int64 `json:"-"`
+	Host               string
+	HeaderChange       string
+	RespHeaderChange   string
+	HostChange         string
+	Location           string
+	PathRewrite        string
+	Remark             string
+	Scheme             string
+	RedirectURL        string
+	HttpsJustProxy     bool
+	TlsOffload         bool
+	AutoSSL            bool
+	CertType           string
+	CertHash           string
+	CertFile           string
+	KeyFile            string
+	NoStore            bool
+	IsClose            bool
+	AutoHttps          bool
+	AutoCORS           bool
+	CompatMode         bool
+	ExpireAt           int64
+	FlowLimit          int64
+	RateLimit          int
+	Flow               *Flow
+	Rate               *rate.Rate `json:"-"`
+	ServiceTraffic     *TrafficStats
+	ServiceMeter       *rate.Meter `json:"-"`
+	MaxConn            int
+	NowConn            int32
+	Client             *Client
+	EntryAclMode       int
+	EntryAclRules      string
+	entryPolicy        *policy.SourceIPPolicy
+	TargetIsHttps      bool
+	Target             *Target
+	UserAuth           *MultiAccount
+	MultiAccount       *MultiAccount
+	Health             `json:"-"`
+	runtimeRouteUUID   string
+	runtimeOwners      *runtimeOwnerPool[*Host]
+	runtimeConnCounter *int32
 	sync.RWMutex
 }
 
-func (s *Host) Update(h *Host) {
-	s.HeaderChange = h.HeaderChange
-	s.RespHeaderChange = h.RespHeaderChange
-	s.HostChange = h.HostChange
-	s.PathRewrite = h.PathRewrite
-	s.Remark = h.Remark
-	s.RedirectURL = h.RedirectURL
-	s.HttpsJustProxy = h.HttpsJustProxy
-	s.AutoSSL = h.AutoSSL
-	s.CertType = common.GetCertType(h.CertFile)
-	s.CertHash = crypt.FNV1a64(h.CertType, h.CertFile, h.KeyFile)
-	s.CertFile = h.CertFile
-	s.KeyFile = h.KeyFile
-	s.AutoHttps = h.AutoHttps
-	s.AutoCORS = h.AutoCORS
-	s.CompatMode = h.CompatMode
-	s.TargetIsHttps = h.TargetIsHttps
-	s.Target = h.Target
-	s.MultiAccount = h.MultiAccount
-}
-
-func (s *Host) AddConn() {
-	atomic.AddInt32(&s.NowConn, 1)
-}
-
-func (s *Host) CutConn() {
-	atomic.AddInt32(&s.NowConn, -1)
-}
-
 type Target struct {
-	nowIndex      int
-	TargetStr     string
-	TargetArr     []string
-	LocalProxy    bool
-	ProxyProtocol int // 0=off, 1=v1, 2=v2
+	nowIndex        int
+	TargetStr       string
+	TargetArr       []string
+	LocalProxy      bool
+	ProxyProtocol   int
+	targetArrSource string
 	sync.RWMutex
 }
 
 type MultiAccount struct {
-	Content    string
-	AccountMap map[string]string // multi account and pwd
+	Content          string
+	AccountMap       map[string]string
+	accountMapSource string
 }
 
-func GetAccountMap(multiAccount *MultiAccount) map[string]string {
-	var accountMap map[string]string
-	if multiAccount == nil {
-		accountMap = nil
-	} else {
-		accountMap = multiAccount.AccountMap
+type Glob struct {
+	EntryAclMode      int
+	EntryAclRules     string
+	legacyBlackIPList []string
+	sourcePolicy      *policy.SourceIPPolicy
+	sync.RWMutex
+}
+
+func (s *Flow) Add(in, out int64) {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	s.InletFlow += in
+	s.ExportFlow += out
+	onDelta := s.onDelta
+	s.Unlock()
+	if onDelta != nil && (in != 0 || out != 0) {
+		onDelta(in, out)
+	}
+}
+
+func (s *Flow) Sub(in, out int64) {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	s.InletFlow -= in
+	s.ExportFlow -= out
+	if s.InletFlow < 0 {
+		s.InletFlow = 0
+	}
+	if s.ExportFlow < 0 {
+		s.ExportFlow = 0
+	}
+	s.Unlock()
+}
+
+func (s *Flow) SetOnDelta(fn func(in, out int64)) {
+	if s == nil {
+		return
+	}
+	s.Lock()
+	s.onDelta = fn
+	s.Unlock()
+}
+
+func flowSnapshot(s *Flow) (int64, int64) {
+	if s == nil {
+		return 0, 0
+	}
+	s.RLock()
+	defer s.RUnlock()
+	return s.InletFlow, s.ExportFlow
+}
+
+func (s *TrafficStats) Add(in, out int64) (int64, int64, int64) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	currentIn := atomic.LoadInt64(&s.InletBytes)
+	currentOut := atomic.LoadInt64(&s.ExportBytes)
+	if in != 0 {
+		currentIn = atomic.AddInt64(&s.InletBytes, in)
+	}
+	if out != 0 {
+		currentOut = atomic.AddInt64(&s.ExportBytes, out)
+	}
+	return currentIn, currentOut, currentIn + currentOut
+}
+
+func (s *TrafficStats) Snapshot() (int64, int64, int64) {
+	if s == nil {
+		return 0, 0, 0
+	}
+	in := atomic.LoadInt64(&s.InletBytes)
+	out := atomic.LoadInt64(&s.ExportBytes)
+	return in, out, in + out
+}
+
+func (s *TrafficStats) Reset() {
+	if s == nil {
+		return
+	}
+	atomic.StoreInt64(&s.InletBytes, 0)
+	atomic.StoreInt64(&s.ExportBytes, 0)
+}
+
+func rateSnapshot(m *rate.Meter) (int64, int64, int64) {
+	if m == nil {
+		return 0, 0, 0
+	}
+	return m.Snapshot()
+}
+
+func normalizeNonNegativeConnectionLimit(value int) int {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
+func NewMultiAccount(content string) *MultiAccount {
+	account := &MultiAccount{Content: normalizeMultiAccountContent(content)}
+	account.AccountMap = parseMultiAccountContent(account.Content)
+	account.accountMapSource = account.Content
+	return account
+}
+
+func normalizeMultiAccount(account *MultiAccount) *MultiAccount {
+	if account == nil {
+		return nil
+	}
+	account.Content = normalizeMultiAccountContent(account.Content)
+	if account.Content != "" {
+		account.AccountMap = parseMultiAccountContent(account.Content)
+		account.accountMapSource = account.Content
+		if len(account.AccountMap) == 0 {
+			account.AccountMap = nil
+		}
+		return account
+	}
+	if len(account.AccountMap) == 0 {
+		account.AccountMap = nil
+		account.accountMapSource = ""
+		return account
+	}
+	account.accountMapSource = ""
+	return account
+}
+
+func normalizeMultiAccountContent(content string) string {
+	content = strings.ReplaceAll(content, "\r\n", "\n")
+	return strings.TrimSpace(content)
+}
+
+func parseMultiAccountContent(content string) map[string]string {
+	content = normalizeMultiAccountContent(content)
+	if content == "" {
+		return nil
+	}
+	lines := strings.Split(content, "\n")
+	accountMap := make(map[string]string, len(lines))
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		index := strings.Index(line, "=")
+		if index < 0 {
+			accountMap[line] = ""
+			continue
+		}
+		key := strings.TrimSpace(line[:index])
+		if key == "" {
+			continue
+		}
+		accountMap[key] = strings.TrimSpace(line[index+1:])
+	}
+	if len(accountMap) == 0 {
+		return nil
 	}
 	return accountMap
 }
 
-func (s *Target) GetRandomTarget() (string, error) {
-	// Init TargetArr and filter empty lines
-	if s.TargetArr == nil {
-		s.TargetStr = strings.ReplaceAll(s.TargetStr, "：", ":")
-		normalized := strings.ReplaceAll(s.TargetStr, "\r\n", "\n")
-		lines := strings.Split(normalized, "\n")
-		for _, v := range lines {
-			trimmed := strings.TrimSpace(v)
-			if trimmed != "" {
-				s.TargetArr = append(s.TargetArr, trimmed)
-			}
+func GetAccountMap(multiAccount *MultiAccount) map[string]string {
+	if multiAccount == nil {
+		return nil
+	}
+	normalizedContent := normalizeMultiAccountContent(multiAccount.Content)
+	if normalizedContent != "" {
+		if len(multiAccount.AccountMap) > 0 && multiAccount.accountMapSource == normalizedContent {
+			return multiAccount.AccountMap
 		}
+		if accountMap := parseMultiAccountContent(normalizedContent); len(accountMap) > 0 {
+			return accountMap
+		}
+		return nil
 	}
-
-	if len(s.TargetArr) == 1 {
-		return s.TargetArr[0], nil
+	if len(multiAccount.AccountMap) > 0 {
+		return multiAccount.AccountMap
 	}
-	if len(s.TargetArr) == 0 {
-		return "", errors.New("all inward-bending targets are offline")
-	}
-
-	s.Lock()
-	defer s.Unlock()
-	if s.nowIndex >= len(s.TargetArr)-1 {
-		s.nowIndex = -1
-	}
-	s.nowIndex++
-	return s.TargetArr[s.nowIndex], nil
+	return nil
 }
 
-type Glob struct {
-	BlackIpList []string
-	sync.RWMutex
+func CloneMultiAccountSnapshot(account *MultiAccount) *MultiAccount {
+	return cloneMultiAccountSnapshot(account)
+}
+
+func cloneMultiAccountSnapshot(account *MultiAccount) *MultiAccount {
+	if account == nil {
+		return nil
+	}
+	cloned := &MultiAccount{
+		Content:          normalizeMultiAccountContent(account.Content),
+		accountMapSource: account.accountMapSource,
+	}
+	if accountMap := GetAccountMap(account); len(accountMap) > 0 {
+		cloned.AccountMap = make(map[string]string, len(accountMap))
+		for key, value := range accountMap {
+			cloned.AccountMap[key] = value
+		}
+		if cloned.Content != "" {
+			cloned.accountMapSource = cloned.Content
+		}
+	}
+	return cloned
 }

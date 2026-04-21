@@ -13,13 +13,28 @@ import (
 	"github.com/gorilla/sessions"
 )
 
-const sessionName = "nps_session"
+const (
+	sessionName       = "nps_session"
+	sessionContextKey = "nps.session"
+	requestDataKey    = "nps.request_data"
+	requestParamsKey  = "nps.request_params"
+	requestRawBodyKey = "nps.request_raw_body"
+)
 
 type sessionState struct {
 	store   *sessions.CookieStore
 	session *sessions.Session
 	writer  http.ResponseWriter
 	request *http.Request
+}
+
+type SessionEditor interface {
+	Set(string, interface{})
+	Delete(string)
+}
+
+type sessionBatchEditor struct {
+	state *sessionState
 }
 
 var (
@@ -107,8 +122,19 @@ func SetSessionValue(g *gin.Context, key string, value interface{}) error {
 	if session == nil {
 		return nil
 	}
-	session.Set(key, value)
-	return nil
+	return session.Set(key, value)
+}
+
+func MutateSession(g *gin.Context, fn func(SessionEditor)) error {
+	if err := EnsureSession(g); err != nil {
+		return err
+	}
+	session := sessionStateFromContext(g)
+	if session == nil || fn == nil {
+		return nil
+	}
+	fn(sessionBatchEditor{state: session})
+	return session.save()
 }
 
 func DeleteSessionValue(g *gin.Context, key string) error {
@@ -119,14 +145,92 @@ func DeleteSessionValue(g *gin.Context, key string) error {
 	if session == nil {
 		return nil
 	}
-	session.Delete(key)
-	return nil
+	return session.Delete(key)
 }
 
 func sessionStateFromContext(g *gin.Context) *sessionState {
 	if v, ok := g.Get(sessionContextKey); ok {
 		if session, ok := v.(*sessionState); ok {
 			return session
+		}
+	}
+	return nil
+}
+
+func SetRequestData(g *gin.Context, key string, value interface{}) {
+	data := requestDataFromContext(g)
+	if data == nil {
+		data = make(map[string]interface{})
+		g.Set(requestDataKey, data)
+	}
+	data[key] = value
+	g.Set(key, value)
+}
+
+func SetRequestParam(g *gin.Context, key, value string) {
+	params := requestParamsFromContext(g)
+	if params == nil {
+		params = make(map[string]string)
+		g.Set(requestParamsKey, params)
+	}
+	params[key] = value
+}
+
+func RequestParam(g *gin.Context, key string) (string, bool) {
+	params := requestParamsFromContext(g)
+	if params == nil {
+		return "", false
+	}
+	value, ok := params[key]
+	return value, ok
+}
+
+func SetRequestRawBody(g *gin.Context, body []byte) {
+	if g == nil {
+		return
+	}
+	if body == nil {
+		g.Set(requestRawBodyKey, []byte(nil))
+		return
+	}
+	g.Set(requestRawBodyKey, append([]byte(nil), body...))
+}
+
+// RequestRawBodyView exposes the captured request body without an extra read-side
+// clone. Callers must treat the returned bytes as read-only.
+func RequestRawBodyView(g *gin.Context) []byte {
+	if g == nil {
+		return nil
+	}
+	if v, ok := g.Get(requestRawBodyKey); ok {
+		if body, ok := v.([]byte); ok {
+			return body
+		}
+	}
+	return nil
+}
+
+func RequestRawBody(g *gin.Context) []byte {
+	body := RequestRawBodyView(g)
+	if len(body) == 0 {
+		return body
+	}
+	return append([]byte(nil), body...)
+}
+
+func requestDataFromContext(g *gin.Context) map[string]interface{} {
+	if v, ok := g.Get(requestDataKey); ok {
+		if data, ok := v.(map[string]interface{}); ok {
+			return data
+		}
+	}
+	return nil
+}
+
+func requestParamsFromContext(g *gin.Context) map[string]string {
+	if v, ok := g.Get(requestParamsKey); ok {
+		if params, ok := v.(map[string]string); ok {
+			return params
 		}
 	}
 	return nil
@@ -139,31 +243,63 @@ func (s *sessionState) Get(key string) interface{} {
 	return s.session.Values[key]
 }
 
-func (s *sessionState) Set(key string, value interface{}) {
+func (s *sessionState) Set(key string, value interface{}) error {
 	if s == nil || s.session == nil {
-		return
+		return nil
 	}
 	s.session.Values[key] = value
-	_ = s.session.Save(s.request, s.writer)
+	return s.session.Save(s.request, s.writer)
 }
 
-func (s *sessionState) Delete(key string) {
+func (s *sessionState) Delete(key string) error {
 	if s == nil || s.session == nil {
-		return
+		return nil
 	}
 	delete(s.session.Values, key)
-	_ = s.session.Save(s.request, s.writer)
+	return s.save()
+}
+
+func (s *sessionState) save() error {
+	if s == nil || s.session == nil {
+		return nil
+	}
+	return s.session.Save(s.request, s.writer)
+}
+
+func (e sessionBatchEditor) Set(key string, value interface{}) {
+	if e.state == nil || e.state.session == nil {
+		return
+	}
+	e.state.session.Values[key] = value
+}
+
+func (e sessionBatchEditor) Delete(key string) {
+	if e.state == nil || e.state.session == nil {
+		return
+	}
+	delete(e.state.session.Values, key)
 }
 
 func buildSessionStore(cfg *servercfg.Snapshot) (*sessions.CookieStore, error) {
+	if cfg == nil {
+		cfg = currentSessionConfigLocked()
+	}
 	authKey, encKey, err := deriveSessionKeys(cfg)
 	if err != nil {
 		return nil, err
 	}
 	store := sessions.NewCookieStore(authKey, encKey)
+	cookiePath := "/"
+	if cfg != nil {
+		basePath := servercfg.NormalizeBaseURL(cfg.Web.BaseURL)
+		if basePath != "" && basePath != "/" {
+			cookiePath = basePath
+		}
+	}
 	store.Options = &sessions.Options{
-		Path:     "/",
+		Path:     cookiePath,
 		HttpOnly: true,
+		Secure:   cfg != nil && cfg.Security.SecureMode,
 		SameSite: http.SameSiteLaxMode,
 	}
 	return store, nil
@@ -172,7 +308,16 @@ func buildSessionStore(cfg *servercfg.Snapshot) (*sessions.CookieStore, error) {
 func clearSessionCookie(store *sessions.CookieStore, w http.ResponseWriter, r *http.Request) error {
 	session := newBlankSession(store)
 	session.Options.MaxAge = -1
-	return session.Save(r, w)
+	if err := session.Save(r, w); err != nil {
+		return err
+	}
+	if session.Options == nil || session.Options.Path == "/" {
+		return nil
+	}
+	rootSession := newBlankSession(store)
+	rootSession.Options.MaxAge = -1
+	rootSession.Options.Path = "/"
+	return rootSession.Save(r, w)
 }
 
 func newBlankSession(store *sessions.CookieStore) *sessions.Session {
@@ -210,10 +355,5 @@ func currentSessionConfig() *servercfg.Snapshot {
 }
 
 func currentSessionConfigLocked() *servercfg.Snapshot {
-	if sessionConfigProvider != nil {
-		if cfg := sessionConfigProvider(); cfg != nil {
-			return cfg
-		}
-	}
-	return servercfg.Current()
+	return servercfg.ResolveProvider(sessionConfigProvider)
 }

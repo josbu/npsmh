@@ -13,6 +13,7 @@ import (
 )
 
 func (s *runtimeSession) startSpray(ctx context.Context) {
+	s.markSprayStarted()
 	directTargets := filterPunchTargetsForLocalAddr(s.localConn.LocalAddr(), s.directSprayTargets())
 	targetPhases := filterTargetStagesForLocalAddr(s.localConn.LocalAddr(), s.targetSprayStages())
 	targetTargets := flattenTargetStages(targetPhases)
@@ -39,14 +40,14 @@ func (s *runtimeSession) startSpray(ctx context.Context) {
 	if len(directTargets) > 0 {
 		s.startSprayPhase(ctx, "direct", directTargets, directPhaseRounds(s.plan), directPhaseBurst(s.plan))
 	}
-	if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+	if s.cm.HasConfirmedOrNominated() {
 		return
 	}
 	if s.plan.UseTargetSpray {
 		for _, phase := range targetPhases {
 			rounds, burst := targetPhaseBudget(s.plan, phase.Name)
 			s.startSprayPhase(ctx, phase.Name, phase.Targets, rounds, burst)
-			if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+			if s.cm.HasConfirmedOrNominated() {
 				return
 			}
 		}
@@ -90,7 +91,7 @@ func (s *runtimeSession) runBirthdaySpray(ctx context.Context) {
 			"targets_per_port": strconv.Itoa(len(targets)),
 		})
 		s.runSprayMatrixOnce(ctx, activeSockets, targets)
-		if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+		if s.cm.HasConfirmedOrNominated() {
 			return
 		}
 		if round < s.plan.SprayRounds-1 && !sleepContext(ctx, s.ensurePacer().sprayPhaseGap(round, s.plan.SprayPhaseGap)) {
@@ -100,17 +101,13 @@ func (s *runtimeSession) runBirthdaySpray(ctx context.Context) {
 	s.runPeriodicSpray(ctx, s.ensureBirthdaySockets(ctx, baseBind, s.plan.BirthdayListenPorts), targets)
 }
 
-func (s *runtimeSession) runSprayRounds(ctx context.Context, sendConn net.PacketConn, targets []string) {
-	s.runSprayRoundsWithBudget(ctx, sendConn, targets, s.plan.SprayRounds, s.plan.SprayBurst)
-}
-
 func (s *runtimeSession) runSprayRoundsWithBudget(ctx context.Context, sendConn net.PacketConn, targets []string, rounds, burst int) {
 	if rounds <= 0 || burst <= 0 {
 		return
 	}
 	for round := 0; round < rounds; round++ {
 		s.runSprayPassWithBurst(ctx, sendConn, targets, burst)
-		if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+		if s.cm.HasConfirmedOrNominated() {
 			return
 		}
 		if round < rounds-1 && !sleepContext(ctx, s.ensurePacer().sprayPhaseGap(round, s.plan.SprayPhaseGap)) {
@@ -125,7 +122,7 @@ func (s *runtimeSession) runSprayMatrixOnce(ctx context.Context, sockets []net.P
 			continue
 		}
 		s.runSprayPass(ctx, socket, targets)
-		if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+		if s.cm.HasConfirmedOrNominated() {
 			return
 		}
 	}
@@ -133,7 +130,7 @@ func (s *runtimeSession) runSprayMatrixOnce(ctx context.Context, sockets []net.P
 
 func (s *runtimeSession) runPeriodicSpray(ctx context.Context, sockets []net.PacketConn, targets []string) {
 	for attempt := 0; ; attempt++ {
-		if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+		if s.cm.HasConfirmedOrNominated() {
 			return
 		}
 		delay := s.ensurePacer().periodicRetryDelay(attempt)
@@ -143,7 +140,7 @@ func (s *runtimeSession) runPeriodicSpray(ctx context.Context, sockets []net.Pac
 			timer.Stop()
 			return
 		case <-timer.C:
-			if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+			if s.cm.HasConfirmedOrNominated() {
 				return
 			}
 			_ = s.sendProgress("spray_retry", "ok", fmt.Sprintf("attempt=%d", attempt+1), addrString(s.localConn.LocalAddr()), s.cm.CandidateRemote(), map[string]string{
@@ -169,11 +166,11 @@ func (s *runtimeSession) runSprayPassWithBurst(ctx context.Context, sendConn net
 			return
 		default:
 		}
-		if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+		if s.cm.HasConfirmedOrNominated() {
 			return
 		}
 		for burst := 0; burst < burstCount; burst++ {
-			if s.cm.ConfirmedPair() != nil || s.cm.NominatedPair() != nil {
+			if s.cm.HasConfirmedOrNominated() {
 				return
 			}
 			_ = s.writeUDPToConn(sendConn, packetTypePunch, target.addr)
@@ -257,6 +254,9 @@ func minInt(a, b int) int {
 }
 
 func sleepContext(ctx context.Context, d time.Duration) bool {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if d <= 0 {
 		select {
 		case <-ctx.Done():

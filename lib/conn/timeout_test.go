@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
+	"errors"
 	"io"
 	"math/big"
 	"net"
@@ -126,6 +127,44 @@ func TestTimeoutConnReadWriteSetsDeadline(t *testing.T) {
 	}
 }
 
+func TestNewTimeoutConnNormalizesNonPositiveIdle(t *testing.T) {
+	tests := []struct {
+		name string
+		idle time.Duration
+	}{
+		{name: "zero", idle: 0},
+		{name: "negative", idle: -time.Second},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, server := net.Pipe()
+			defer func() { _ = server.Close() }()
+			spy := &deadlineSpyConn{Conn: client}
+			conn := NewTimeoutConn(spy, tt.idle)
+			defer func() { _ = conn.Close() }()
+
+			started := time.Now()
+			go func() {
+				_, _ = server.Write([]byte("x"))
+			}()
+
+			buf := make([]byte, 1)
+			if _, err := conn.Read(buf); err != nil {
+				t.Fatalf("Read() error = %v", err)
+			}
+
+			firstDeadline, calls := spy.snapshot()
+			if calls == 0 {
+				t.Fatal("expected SetDeadline to be called")
+			}
+			if firstDeadline.Before(started.Add(defaultTimeOut - 250*time.Millisecond)) {
+				t.Fatalf("deadline = %v, want normalized idle near now+%s", firstDeadline, defaultTimeOut)
+			}
+		})
+	}
+}
+
 func TestNewTimeoutTLSConnSuccess(t *testing.T) {
 	cert := testSelfSignedCert(t)
 
@@ -202,6 +241,70 @@ func TestNewTimeoutTLSConnHandshakeFailureClosesRaw(t *testing.T) {
 		t.Fatal("expected raw conn to be closed on handshake failure")
 	}
 	<-done
+}
+
+func TestNewTimeoutTLSConnRejectsNilRawConn(t *testing.T) {
+	conn, err := NewTimeoutTLSConn(nil, &tls.Config{InsecureSkipVerify: true}, 200*time.Millisecond, 2*time.Second)
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("NewTimeoutTLSConn(nil) error = %v, want %v", err, net.ErrClosed)
+	}
+	if conn != nil {
+		t.Fatalf("NewTimeoutTLSConn(nil) conn = %v, want nil", conn)
+	}
+}
+
+func TestTimeoutConnHelpersHandleNilState(t *testing.T) {
+	var nilConn *TimeoutConn
+	if _, err := nilConn.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("nil Read() error = %v, want %v", err, net.ErrClosed)
+	}
+	if _, err := nilConn.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("nil Write() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := nilConn.SetDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("nil SetDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := nilConn.SetReadDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("nil SetReadDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := nilConn.SetWriteDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("nil SetWriteDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := nilConn.Close(); err != nil {
+		t.Fatalf("nil Close() error = %v, want nil", err)
+	}
+	if got := nilConn.LocalAddr(); got != nil {
+		t.Fatalf("nil LocalAddr() = %v, want nil", got)
+	}
+	if got := nilConn.RemoteAddr(); got != nil {
+		t.Fatalf("nil RemoteAddr() = %v, want nil", got)
+	}
+
+	malformed := &TimeoutConn{}
+	if _, err := malformed.Read(make([]byte, 1)); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("malformed Read() error = %v, want %v", err, net.ErrClosed)
+	}
+	if _, err := malformed.Write([]byte("x")); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("malformed Write() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := malformed.SetDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("malformed SetDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := malformed.SetReadDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("malformed SetReadDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := malformed.SetWriteDeadline(time.Now()); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("malformed SetWriteDeadline() error = %v, want %v", err, net.ErrClosed)
+	}
+	if err := malformed.Close(); err != nil {
+		t.Fatalf("malformed Close() error = %v, want nil", err)
+	}
+	if got := malformed.LocalAddr(); got != nil {
+		t.Fatalf("malformed LocalAddr() = %v, want nil", got)
+	}
+	if got := malformed.RemoteAddr(); got != nil {
+		t.Fatalf("malformed RemoteAddr() = %v, want nil", got)
+	}
 }
 
 func generateSelfSignedCert(t *testing.T) tls.Certificate {

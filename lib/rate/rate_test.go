@@ -2,6 +2,7 @@ package rate
 
 import (
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -123,5 +124,68 @@ func TestNilRateSafety(t *testing.T) {
 	}
 	if string(b) != "null" {
 		t.Fatalf("nil MarshalJSON=%s, want null", string(b))
+	}
+}
+
+func TestRateCloneDetachesRuntimeState(t *testing.T) {
+	original := NewRate(2048)
+	original.Get(64)
+
+	cloned := original.Clone()
+	if cloned == nil {
+		t.Fatal("Clone() = nil, want detached rate copy")
+	}
+	if cloned == original {
+		t.Fatal("Clone() returned original pointer, want detached copy")
+	}
+	if cloned.Limit() != original.Limit() {
+		t.Fatalf("Clone().Limit() = %d, want %d", cloned.Limit(), original.Limit())
+	}
+	if cloned.stopCh() == original.stopCh() {
+		t.Fatal("Clone() should not reuse the original stop channel")
+	}
+
+	cloned.ResetLimit(0)
+	if got := original.Limit(); got != 2048 {
+		t.Fatalf("original limit after clone mutation = %d, want 2048", got)
+	}
+
+	original.Stop()
+	if cloned.stopCh() == nil {
+		t.Fatal("clone stop channel = nil after original Stop(), want independent channel")
+	}
+	select {
+	case <-cloned.stopCh():
+		t.Fatal("clone stop channel closed when original stopped")
+	default:
+	}
+}
+
+func TestMeterCloneDetachesMutableState(t *testing.T) {
+	original := NewMeter()
+	original.Add(3, 4)
+
+	cloned := original.Clone()
+	if cloned == nil {
+		t.Fatal("Clone() = nil, want detached meter copy")
+	}
+	if cloned == original {
+		t.Fatal("Clone() returned original pointer, want detached copy")
+	}
+	if atomic.LoadInt64(&cloned.inAcc) != atomic.LoadInt64(&original.inAcc) || atomic.LoadInt64(&cloned.outAcc) != atomic.LoadInt64(&original.outAcc) {
+		t.Fatalf("Clone() accumulators = %d/%d, want %d/%d",
+			atomic.LoadInt64(&cloned.inAcc),
+			atomic.LoadInt64(&cloned.outAcc),
+			atomic.LoadInt64(&original.inAcc),
+			atomic.LoadInt64(&original.outAcc),
+		)
+	}
+
+	cloned.Add(5, 6)
+	if got := atomic.LoadInt64(&original.inAcc); got != 3 {
+		t.Fatalf("original inAcc after clone mutation = %d, want 3", got)
+	}
+	if got := atomic.LoadInt64(&original.outAcc); got != 4 {
+		t.Fatalf("original outAcc after clone mutation = %d, want 4", got)
 	}
 }

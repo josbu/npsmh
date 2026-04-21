@@ -10,6 +10,10 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
+var listenQUICPacketConn = func(localIP string) (net.PacketConn, error) {
+	return net.ListenUDP("udp", common.BuildUDPBindAddr(localIP))
+}
+
 type QuicStreamConn struct {
 	stream *quic.Stream
 	sess   *quic.Conn
@@ -20,38 +24,65 @@ func NewQuicStreamConn(stream *quic.Stream, sess *quic.Conn) *QuicStreamConn {
 }
 
 func (q *QuicStreamConn) GetSession() *quic.Conn {
+	if q == nil {
+		return nil
+	}
 	return q.sess
 }
 
 func (q *QuicStreamConn) Read(p []byte) (int, error) {
+	if q == nil || q.stream == nil {
+		return 0, net.ErrClosed
+	}
 	return q.stream.Read(p)
 }
 
 func (q *QuicStreamConn) Write(p []byte) (int, error) {
+	if q == nil || q.stream == nil {
+		return 0, net.ErrClosed
+	}
 	return q.stream.Write(p)
 }
 
 func (q *QuicStreamConn) Close() error {
+	if q == nil || q.stream == nil {
+		return nil
+	}
 	return q.stream.Close()
 }
 
 func (q *QuicStreamConn) LocalAddr() net.Addr {
+	if q == nil || q.sess == nil {
+		return nil
+	}
 	return q.sess.LocalAddr()
 }
 
 func (q *QuicStreamConn) RemoteAddr() net.Addr {
+	if q == nil || q.sess == nil {
+		return nil
+	}
 	return q.sess.RemoteAddr()
 }
 
 func (q *QuicStreamConn) SetDeadline(t time.Time) error {
+	if q == nil || q.stream == nil {
+		return net.ErrClosed
+	}
 	return q.stream.SetDeadline(t)
 }
 
 func (q *QuicStreamConn) SetReadDeadline(t time.Time) error {
+	if q == nil || q.stream == nil {
+		return net.ErrClosed
+	}
 	return q.stream.SetReadDeadline(t)
 }
 
 func (q *QuicStreamConn) SetWriteDeadline(t time.Time) error {
+	if q == nil || q.stream == nil {
+		return net.ErrClosed
+	}
 	return q.stream.SetWriteDeadline(t)
 }
 
@@ -62,13 +93,15 @@ func NewQuicAutoCloseConn(stream *quic.Stream, sess *quic.Conn) *QuicAutoCloseCo
 }
 
 func (q *QuicAutoCloseConn) Close() error {
-	_ = q.QuicStreamConn.Close()
-	drain := 300 * time.Millisecond
-	ctx, cancel := context.WithTimeout(context.Background(), drain)
-	defer cancel()
-	select {
-	case <-q.QuicStreamConn.stream.Context().Done():
-	case <-ctx.Done():
+	if q == nil || q.QuicStreamConn == nil {
+		return nil
+	}
+	if q.QuicStreamConn.stream != nil {
+		q.QuicStreamConn.stream.CancelRead(0)
+		_ = q.QuicStreamConn.Close()
+	}
+	if q.sess == nil {
+		return nil
 	}
 	return q.sess.CloseWithError(0, "close")
 }
@@ -82,7 +115,7 @@ func DialQuicWithLocalIP(ctx context.Context, server string, tlsCfg *tls.Config,
 	if err != nil {
 		return nil, err
 	}
-	packetConn, err := net.ListenUDP("udp", bindAddr)
+	packetConn, err := listenQUICPacketConn(localIP)
 	if err != nil {
 		return nil, err
 	}
@@ -91,5 +124,14 @@ func DialQuicWithLocalIP(ctx context.Context, server string, tlsCfg *tls.Config,
 		_ = packetConn.Close()
 		return nil, err
 	}
+	go closePacketConnOnDone(sess.Context().Done(), packetConn)
 	return sess, nil
+}
+
+func closePacketConnOnDone(done <-chan struct{}, packetConn net.PacketConn) {
+	if done == nil || packetConn == nil {
+		return
+	}
+	<-done
+	_ = packetConn.Close()
 }

@@ -2,14 +2,13 @@ package main
 
 import (
 	goflag "flag"
-	"log"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/djylb/nps/bridge"
 	"github.com/djylb/nps/lib/common"
@@ -18,11 +17,12 @@ import (
 	"github.com/djylb/nps/lib/file"
 	"github.com/djylb/nps/lib/install"
 	"github.com/djylb/nps/lib/logs"
+	"github.com/djylb/nps/lib/policy"
 	"github.com/djylb/nps/lib/servercfg"
+	"github.com/djylb/nps/lib/serverreload"
 	"github.com/djylb/nps/lib/version"
 	"github.com/djylb/nps/server"
 	"github.com/djylb/nps/server/connection"
-	"github.com/djylb/nps/server/tool"
 	"github.com/djylb/nps/web/routers"
 	"github.com/gin-gonic/gin"
 	"github.com/kardianos/service"
@@ -49,109 +49,20 @@ func main() {
 	flag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 	flag.Parse()
 
-	args := flag.Args()
-	var cmd string
-	if len(args) > 0 {
-		cmd = args[0]
-	}
-
-	// gen TOTP
-	if *genTOTP {
-		crypt.PrintTOTPSecret()
+	cmd := parsePrimaryCommand(flag.Args())
+	if handleImmediateFlags() {
 		return
 	}
-	// get TOTP
-	if *getTOTP != "" {
-		crypt.PrintTOTPCode(*getTOTP)
-		return
-	}
-	// show version
-	if *ver {
-		version.PrintVersion(version.GetLatestIndex())
-		return
-	}
-
-	// set config path
-	if cp := strings.TrimSpace(*confPath); cp != "" {
-		if servercfg.IsSupportedConfigPath(cp) {
-			servercfg.SetPreferredPath(cp)
-			common.ConfPath = filepath.Dir(cp)
-		} else {
-			common.ConfPath = cp
-		}
-	}
-
-	if err := servercfg.LoadDefault(); err != nil {
-		log.Fatalln("load config file error", err.Error())
-	}
-	cfg := servercfg.Current()
-	if strings.TrimSpace(os.Getenv("GIN_MODE")) == "" {
-		gin.SetMode(gin.ReleaseMode)
-	}
-
-	pprofIp := cfg.App.PprofIP
-	pprofPort := cfg.App.PprofPort
-	if pprofPort != "0" {
-		pprofAddr := common.BuildAddress(pprofIp, pprofPort)
-		common.InitPProfByAddr(pprofAddr)
-	}
-
-	err := common.SetTimezone(cfg.App.Timezone)
+	startup, err := loadStartupConfig(*confPath)
 	if err != nil {
-		logs.Warn("Set timezone error %v", err)
+		_, _ = os.Stderr.WriteString(err.Error() + "\n")
+		os.Exit(1)
 	}
-	common.SetCustomDNS(cfg.App.DNSServer)
-	logType := cfg.Log.Type
-	logLevel = cfg.Log.Level
-	logPath := cfg.Log.Path
-	if logPath == "" || strings.EqualFold(logPath, "on") || strings.EqualFold(logPath, "true") {
-		logPath = common.GetLogPath()
-	}
-	if !strings.EqualFold(logPath, "off") && !strings.EqualFold(logPath, "false") && !strings.EqualFold(logPath, "docker") && logPath != "/dev/null" {
-		if !filepath.IsAbs(logPath) {
-			logPath = filepath.Join(common.GetRunPath(), logPath)
-		}
-		if common.IsWindows() {
-			logPath = strings.ReplaceAll(logPath, "\\", "\\\\")
-		}
-	}
-	logMaxFiles := cfg.Log.MaxFiles
-	logMaxDays := cfg.Log.MaxDays
-	logMaxSize := cfg.Log.MaxSize
-	logCompress := cfg.Log.Compress
-	logColor := cfg.Log.Color
-
-	// init service
-	options := make(service.KeyValue)
-	svcConfig := &service.Config{
-		Name:        "Nps",
-		DisplayName: "nps内网穿透代理服务器",
-		Description: "一款轻量级、功能强大的内网穿透代理服务器。支持tcp、udp流量转发，支持内网http代理、内网socks5代理，同时支持snappy压缩、站点保护、加密传输、多路复用、header修改等。支持web图形化管理，集成多用户模式。",
-		Option:      options,
-	}
-
-	for _, v := range os.Args[1:] {
-		switch v {
-		case "install", "start", "stop", "uninstall", "restart":
-			continue
-		}
-		svcConfig.Arguments = append(svcConfig.Arguments, v)
-	}
-
-	svcConfig.Arguments = append(svcConfig.Arguments, "service")
-	if len(os.Args) > 1 && os.Args[1] == "service" && !strings.EqualFold(logType, "off") && !strings.EqualFold(logType, "both") {
-		logType = "file"
-	}
-	logs.Init(logType, logLevel, logPath, logMaxSize, logMaxFiles, logMaxDays, logCompress, logColor)
-	if !common.IsWindows() {
-		svcConfig.Dependencies = []string{
-			"Requires=network.target",
-			"After=network-online.target syslog.target"}
-		svcConfig.Option["SystemdScript"] = install.SystemdScript
-		svcConfig.Option["SysvScript"] = install.SysvScript
-	}
+	logSettings := startup.LogSettings
+	logLevel = logSettings.Level
+	logs.Init(logSettings.Type, logLevel, logSettings.Path, logSettings.MaxSize, logSettings.MaxFiles, logSettings.MaxDays, logSettings.Compress, logSettings.Color)
+	svcConfig := buildNPSServiceConfig(os.Args[1:])
 	prg := &nps{}
-	prg.exit = make(chan struct{})
 	s, err := service.New(prg, svcConfig)
 	if err != nil {
 		logs.Error("service function disabled %v", err)
@@ -163,66 +74,8 @@ func main() {
 		return
 	}
 
-	if cmd != "" && cmd != "service" {
-		switch cmd {
-		case "reload":
-			daemon.InitDaemon("nps", common.GetRunPath(), common.GetTmpPath())
-			return
-		case "install":
-			// uninstall before
-			_ = service.Control(s, "stop")
-			_ = service.Control(s, "uninstall")
-
-			binPath := install.NPS()
-			svcConfig.Executable = binPath
-			s, err := service.New(prg, svcConfig)
-			if err != nil {
-				logs.Error("%v", err)
-				return
-			}
-			err = service.Control(s, cmd)
-			if err != nil {
-				logs.Error("Valid actions: %q error: %v", service.ControlAction, err)
-			}
-			if service.Platform() == "unix-systemv" {
-				logs.Info("unix-systemv service")
-				confPath := "/etc/init.d/" + svcConfig.Name
-				_ = os.Symlink(confPath, "/etc/rc.d/S90"+svcConfig.Name)
-				_ = os.Symlink(confPath, "/etc/rc.d/K02"+svcConfig.Name)
-			}
-			return
-		case "start", "restart", "stop":
-			if service.Platform() == "unix-systemv" {
-				logs.Info("unix-systemv service")
-				c := exec.Command("/etc/init.d/"+svcConfig.Name, cmd)
-				if err := c.Run(); err != nil {
-					logs.Error("%v", err)
-				}
-				return
-			}
-			err := service.Control(s, cmd)
-			if err != nil {
-				logs.Error("Valid actions: %q error: %v", service.ControlAction, err)
-			}
-			return
-		case "uninstall":
-			err := service.Control(s, cmd)
-			if err != nil {
-				logs.Error("Valid actions: %q error: %v", service.ControlAction, err)
-			}
-			if service.Platform() == "unix-systemv" {
-				logs.Info("unix-systemv service")
-				_ = os.Remove("/etc/rc.d/S90" + svcConfig.Name)
-				_ = os.Remove("/etc/rc.d/K02" + svcConfig.Name)
-			}
-			return
-		case "update":
-			install.UpdateNps()
-			return
-			//default:
-			//	logs.Error("command is not support")
-			//	return
-		}
+	if handleNPSServiceCommand(cmd, s, svcConfig, prg) {
+		return
 	}
 	_ = s.Run()
 }
@@ -259,18 +112,22 @@ func normalizeLegacyLongFlags() {
 }
 
 type nps struct {
-	exit chan struct{}
+	exit     chan struct{}
+	exitInit sync.Once
+	exitStop sync.Once
 }
 
 func (p *nps) Start(s service.Service) error {
 	_, _ = s.Status()
+	p.exitChan()
 	go func() { _ = p.run() }()
 	return nil
 }
 func (p *nps) Stop(s service.Service) error {
 	_, _ = s.Status()
-	close(p.exit)
-	if service.Interactive() {
+	routers.StopManagedRuntime()
+	p.signalExit()
+	if npsServiceInteractive() {
 		os.Exit(0)
 	}
 	return nil
@@ -286,43 +143,254 @@ func (p *nps) run() error {
 		}
 	}()
 	run()
-	<-p.exit
+	<-p.exitChan()
 	logs.Warn("stop...")
 	return nil
 }
 
+var npsServiceInteractive = service.Interactive
+
+func (p *nps) exitChan() chan struct{} {
+	if p == nil {
+		ch := make(chan struct{})
+		close(ch)
+		return ch
+	}
+	p.exitInit.Do(func() {
+		if p.exit == nil {
+			p.exit = make(chan struct{})
+		}
+	})
+	return p.exit
+}
+
+func (p *nps) signalExit() {
+	if p == nil {
+		return
+	}
+	ch := p.exitChan()
+	p.exitStop.Do(func() {
+		close(ch)
+	})
+}
+
+type npsStartup struct {
+	Config      *servercfg.Snapshot
+	LogSettings serverreload.LogSettings
+}
+
+func parsePrimaryCommand(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	return args[0]
+}
+
+func handleImmediateFlags() bool {
+	if *genTOTP {
+		crypt.PrintTOTPSecret()
+		return true
+	}
+	if *getTOTP != "" {
+		crypt.PrintTOTPCode(*getTOTP)
+		return true
+	}
+	if *ver {
+		version.PrintVersion(version.GetLatestIndex())
+		return true
+	}
+	return false
+}
+
+func loadStartupConfig(path string) (npsStartup, error) {
+	applyConfiguredPathFlag(path)
+	if err := servercfg.LoadDefault(); err != nil {
+		return npsStartup{}, fmt.Errorf("load config file error: %w", err)
+	}
+	cfg := servercfg.Current()
+	policy.SetDefaultGeoIPPath(policy.ResolveGeoIPPath(servercfg.Path(), cfg.App.GeoIPPath))
+	policy.SetDefaultGeoSitePath(policy.ResolveGeoSitePath(servercfg.Path(), cfg.App.GeoSitePath))
+	if strings.TrimSpace(os.Getenv("GIN_MODE")) == "" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	if cfg.App.PprofPort != "0" {
+		common.InitPProfByAddr(common.BuildAddress(cfg.App.PprofIP, cfg.App.PprofPort))
+	}
+	if tz := strings.TrimSpace(cfg.App.Timezone); tz != "" {
+		if err := common.SetTimezone(tz); err != nil {
+			logs.Warn("Set timezone error %v", err)
+		}
+	}
+	common.SetCustomDNS(cfg.App.DNSServer)
+	return npsStartup{
+		Config:      cfg,
+		LogSettings: serverreload.ResolveLogSettings(cfg),
+	}, nil
+}
+
+func applyConfiguredPathFlag(path string) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return
+	}
+	if servercfg.IsSupportedConfigPath(path) {
+		servercfg.SetPreferredPath(path)
+		common.ConfPath = filepath.Dir(path)
+		return
+	}
+	common.ConfPath = path
+}
+
+func buildNPSServiceConfig(args []string) *service.Config {
+	options := make(service.KeyValue)
+	svcConfig := &service.Config{
+		Name:        "Nps",
+		DisplayName: "nps内网穿透代理服务器",
+		Description: "一款轻量级、功能强大的内网穿透代理服务器。支持tcp、udp流量转发，支持内网http代理、内网socks5代理，同时支持snappy压缩、站点保护、加密传输、多路复用、header修改等。支持web图形化管理，集成多用户模式。",
+		Option:      options,
+	}
+	for _, arg := range args {
+		switch arg {
+		case "install", "start", "stop", "uninstall", "restart":
+			continue
+		}
+		svcConfig.Arguments = append(svcConfig.Arguments, arg)
+	}
+	svcConfig.Arguments = append(svcConfig.Arguments, "service")
+	if !common.IsWindows() {
+		svcConfig.Dependencies = []string{
+			"Requires=network.target",
+			"After=network-online.target syslog.target",
+		}
+		svcConfig.Option["SystemdScript"] = install.SystemdScript
+		svcConfig.Option["SysvScript"] = install.SysvScript
+	}
+	return svcConfig
+}
+
+func handleNPSServiceCommand(cmd string, svc service.Service, svcConfig *service.Config, prg *nps) bool {
+	if cmd == "" || cmd == "service" {
+		return false
+	}
+	switch cmd {
+	case "reload":
+		daemon.InitDaemon("nps", common.GetRunPath(), common.GetTmpPath())
+		return true
+	case "install":
+		_ = service.Control(svc, "stop")
+		_ = service.Control(svc, "uninstall")
+
+		executable, err := install.NPS()
+		if err != nil {
+			logs.Error("%v", err)
+			return true
+		}
+		svcConfig.Executable = executable
+		installedSvc, err := service.New(prg, svcConfig)
+		if err != nil {
+			logs.Error("%v", err)
+			return true
+		}
+		if err := service.Control(installedSvc, cmd); err != nil {
+			logs.Error("Valid actions: %q error: %v", service.ControlAction, err)
+		}
+		if service.Platform() == "unix-systemv" {
+			logs.Info("unix-systemv service")
+			confPath := "/etc/init.d/" + svcConfig.Name
+			_ = os.Symlink(confPath, "/etc/rc.d/S90"+svcConfig.Name)
+			_ = os.Symlink(confPath, "/etc/rc.d/K02"+svcConfig.Name)
+		}
+		return true
+	case "start", "restart", "stop":
+		if service.Platform() == "unix-systemv" {
+			logs.Info("unix-systemv service")
+			command := exec.Command("/etc/init.d/"+svcConfig.Name, cmd)
+			if err := command.Run(); err != nil {
+				logs.Error("%v", err)
+			}
+			return true
+		}
+		if err := service.Control(svc, cmd); err != nil {
+			logs.Error("Valid actions: %q error: %v", service.ControlAction, err)
+		}
+		return true
+	case "uninstall":
+		if err := service.Control(svc, cmd); err != nil {
+			logs.Error("Valid actions: %q error: %v", service.ControlAction, err)
+		}
+		if service.Platform() == "unix-systemv" {
+			logs.Info("unix-systemv service")
+			_ = os.Remove("/etc/rc.d/S90" + svcConfig.Name)
+			_ = os.Remove("/etc/rc.d/K02" + svcConfig.Name)
+		}
+		return true
+	case "update":
+		if err := install.UpdateNps(); err != nil {
+			logs.Error("%v", err)
+		}
+		return true
+	default:
+		return false
+	}
+}
+
 func run() {
 	cfg := servercfg.Current()
-	server.SetWebHandler(routers.Init())
-	task := &file.Tunnel{
-		Mode: "webServer",
+	file.MigrateLegacyData()
+
+	runMode := resolveServerRunMode(cfg)
+	warnLegacyManagedNodeMode(cfg, runMode)
+	initializeServerRuntime(cfg)
+	startServerProcesses(true, cfg.Runtime.DisconnectTimeout)
+}
+
+func resolveServerRunMode(cfg *servercfg.Snapshot) string {
+	runMode := strings.ToLower(strings.TrimSpace(cfg.Runtime.RunMode))
+	if runMode == "" {
+		return "standalone"
 	}
-	if cfg.Security.SecureMode {
-		bridge.ServerSecureMode = true
+	return runMode
+}
+
+func warnLegacyManagedNodeMode(cfg *servercfg.Snapshot, runMode string) {
+	if runMode == "node" && strings.TrimSpace(cfg.Runtime.MasterURL) != "" && strings.TrimSpace(cfg.Runtime.NodeToken) != "" {
+		logs.Warn("legacy remote-managed node mode is deprecated; using local store with management platform compatibility")
 	}
+}
+
+func initializeServerRuntime(cfg *servercfg.Snapshot) {
+	initializeServerStore()
+	applyServerRuntimeConfig()
+	logServerStartup()
+	connection.InitConnectionService()
+	applyBridgeServerToggles(cfg)
+}
+
+func initializeServerStore() {
+	file.GlobalStore = file.NewLocalStore()
+}
+
+func applyServerRuntimeConfig() {
+	if err := serverreload.ApplyCurrentConfig(); err != nil {
+		logs.Error("apply runtime config failed: %v", err)
+	}
+}
+
+func logServerStartup() {
 	logs.Info("the config path is: %s", servercfg.Path())
 	logs.Info("the version of server is %s, allow client core version to be %s", version.VERSION, version.GetMinVersion(bridge.ServerSecureMode))
-	_ = bridge.SetClientSelectMode(cfg.Bridge.SelectMode)
-	ntpServer := cfg.App.NTPServer
-	ntpInterval := cfg.App.NTPInterval
-	common.SetNtpServer(ntpServer)
-	common.SetNtpInterval(time.Duration(ntpInterval) * time.Minute)
-	go common.SyncTime()
-	connection.InitConnectionService()
-	//crypt.InitTls(filepath.Join(common.GetRunPath(), "conf", "server.pem"), filepath.Join(common.GetRunPath(), "conf", "server.key"))
-	cert, ok := common.LoadCert(cfg.Bridge.CertFile, cfg.Bridge.KeyFile)
-	if !ok {
-		logs.Info("Using randomly generated certificate.")
-	}
-	crypt.InitTls(cert)
-	tool.InitAllowPort()
-	tool.StartSystemInfo()
-	timeout := cfg.Runtime.DisconnectTimeout
+}
+
+func applyBridgeServerToggles(cfg *servercfg.Snapshot) {
 	bridge.ServerKcpEnable = cfg.Bridge.ServerKCPEnabled
 	bridge.ServerQuicEnable = cfg.Bridge.ServerQUICEnabled
 	bridge.ServerTcpEnable = cfg.Bridge.ServerTCPEnabled
 	bridge.ServerTlsEnable = cfg.Bridge.ServerTLSEnabled
 	bridge.ServerWsEnable = cfg.Bridge.ServerWSEnabled
 	bridge.ServerWssEnable = cfg.Bridge.ServerWSSEnabled
-	go server.StartNewServer(task, timeout)
+}
+
+func startServerProcesses(enableWebServer bool, timeout int) {
+	server.StartLifecycleMonitor()
+	go server.StartServerEngine(enableWebServer, timeout)
 }

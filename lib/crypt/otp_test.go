@@ -1,9 +1,15 @@
 package crypt
 
 import (
+	"bytes"
+	"errors"
 	"net/url"
+	"os"
 	"regexp"
+	"strings"
 	"testing"
+
+	"github.com/skip2/go-qrcode"
 )
 
 func TestGenerateTOTPSecret(t *testing.T) {
@@ -76,6 +82,29 @@ func TestIsValidTOTPSecret(t *testing.T) {
 	}
 }
 
+func TestTOTPSecretValidationAcceptsLowercaseAndWhitespace(t *testing.T) {
+	secret, err := GenerateTOTPSecret()
+	if err != nil {
+		t.Fatalf("GenerateTOTPSecret() error = %v", err)
+	}
+	normalized := "  " + strings.ToLower(secret) + "  "
+
+	if !IsValidTOTPSecret(normalized) {
+		t.Fatalf("IsValidTOTPSecret(%q) = false, want true", normalized)
+	}
+	code, _, err := GetTOTPCode(normalized)
+	if err != nil {
+		t.Fatalf("GetTOTPCode() error = %v", err)
+	}
+	ok, err := ValidateTOTPCode(normalized, " "+code+" ")
+	if err != nil {
+		t.Fatalf("ValidateTOTPCode() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ValidateTOTPCode() = false, want true")
+	}
+}
+
 func TestBuildTotpUri(t *testing.T) {
 	secret := "JBSWY3DPEHPK3PXP"
 	withIssuer := BuildTotpUri("nps team", "alice@example.com", secret)
@@ -88,5 +117,37 @@ func TestBuildTotpUri(t *testing.T) {
 	wantWithoutIssuer := "otpauth://totp/" + url.QueryEscape("alice@example.com") + "?secret=" + secret
 	if withoutIssuer != wantWithoutIssuer {
 		t.Fatalf("BuildTotpUri(without issuer) = %q, want %q", withoutIssuer, wantWithoutIssuer)
+	}
+}
+
+func TestPrintTOTPSecretDoesNotPanicOnQRCodeError(t *testing.T) {
+	oldNewQRCode := newQRCode
+	defer func() { newQRCode = oldNewQRCode }()
+	newQRCode = func(content string, level qrcode.RecoveryLevel) (*qrcode.QRCode, error) {
+		return nil, errors.New("qr-failed")
+	}
+
+	oldStdout := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe() error = %v", err)
+	}
+	os.Stdout = w
+	defer func() { os.Stdout = oldStdout }()
+
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("PrintTOTPSecret() panic = %v, want printed error", recovered)
+		}
+	}()
+
+	PrintTOTPSecret()
+	_ = w.Close()
+	var buf bytes.Buffer
+	if _, err := buf.ReadFrom(r); err != nil {
+		t.Fatalf("ReadFrom(stdout) error = %v", err)
+	}
+	if !strings.Contains(buf.String(), "Failed to generate 2FA QR code") {
+		t.Fatalf("PrintTOTPSecret() output = %q, want QR generation error", buf.String())
 	}
 }

@@ -1,16 +1,15 @@
-![logo](https://cdn.jsdelivr.net/gh/djylb/nps/docs/logo.svg)
+![logo](assets/logo.svg)
 
-# NPS <small>0.34.8</small>
+# NPS <small>0.35.0</small>
 
-> 一款轻量级、高性能、功能强大的内网穿透代理服务器
+> 一款轻量级的内网穿透代理服务器
 
-- 开源、免费、持续更新
-- 几乎支持所有协议
-- 支持内网HTTP/HTTPS代理、内网Socks5代理、P2P等
-- 简洁且功能强大的Web管理界面
-- 支持服务端、客户端同时控制
-- 扩展功能强大
-- 全平台兼容，一键注册为服务
+- 把内网站点、SSH、数据库和其他服务接到公网
+- 支持域名转发、端口隧道、代理和 P2P 访问
+- 适合第一次部署，也适合长期维护
+- 提供 Web 管理界面和通用管理接口
 
-[GitHub](https://github.com/djylb/nps/)
-[开始使用](#nps)
+[开始阅读](#/README)
+[10 分钟快速开始](#/getting-started/quick-start)
+[接口与集成](#/reference/integration/README)
+[查看仓库](https://github.com/djylb/nps)

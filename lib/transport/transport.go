@@ -3,12 +3,21 @@
 package transport
 
 import (
+	"errors"
 	"net"
 
 	"golang.org/x/sys/unix"
 )
 
+var errInvalidKeepAliveParams = errors.New("tcp keepalive parameters must be positive")
+
 func SetTcpKeepAliveParams(tc *net.TCPConn, idle, intvl, probes int) error {
+	switch {
+	case tc == nil:
+		return net.ErrClosed
+	case idle <= 0 || intvl <= 0 || probes <= 0:
+		return errInvalidKeepAliveParams
+	}
 	raw, err := tc.SyscallConn()
 	if err != nil {
 		return err

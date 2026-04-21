@@ -14,9 +14,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -32,6 +32,113 @@ var (
 	SkipVerify = false
 	tlsCfg     *tls.Config
 )
+
+const defaultMaxSize = 8192
+
+type SniffConn struct {
+	net.Conn
+	mu           sync.Mutex
+	buf          []byte
+	Rb           []byte
+	maxSize      int
+	limitReached bool
+}
+
+func NewSniffConn(conn net.Conn, maxSize int) *SniffConn {
+	if maxSize <= 0 {
+		maxSize = defaultMaxSize
+	}
+	return &SniffConn{
+		Conn:    conn,
+		buf:     make([]byte, 0, maxSize),
+		maxSize: maxSize,
+	}
+}
+
+func (s *SniffConn) Read(p []byte) (int, error) {
+	s.mu.Lock()
+	if len(s.Rb) > 0 {
+		n := copy(p, s.Rb)
+		s.Rb = s.Rb[n:]
+		s.mu.Unlock()
+		return n, nil
+	}
+	if s.limitReached {
+		s.mu.Unlock()
+		return 0, io.EOF
+	}
+	s.mu.Unlock()
+
+	n, err := s.Conn.Read(p)
+	if n > 0 {
+		s.mu.Lock()
+		if remaining := s.maxSize - len(s.buf); remaining > 0 {
+			if remaining > n {
+				remaining = n
+			}
+			s.buf = append(s.buf, p[:remaining]...)
+		}
+		if len(s.buf) >= s.maxSize {
+			s.limitReached = true
+			s.mu.Unlock()
+			return n, io.EOF
+		}
+		s.mu.Unlock()
+	}
+	return n, err
+}
+
+func (s *SniffConn) Bytes() []byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf
+}
+
+type ReadOnlyConn struct {
+	r          *SniffConn
+	remoteAddr net.Addr
+}
+
+func (c *ReadOnlyConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+func (c *ReadOnlyConn) Write(_ []byte) (int, error) {
+	return 0, errors.New("readOnlyConn: write not allowed")
+}
+func (c *ReadOnlyConn) Close() error                       { return nil }
+func (c *ReadOnlyConn) LocalAddr() net.Addr                { return nil }
+func (c *ReadOnlyConn) RemoteAddr() net.Addr               { return c.remoteAddr }
+func (c *ReadOnlyConn) SetDeadline(_ time.Time) error      { return nil }
+func (c *ReadOnlyConn) SetReadDeadline(_ time.Time) error  { return nil }
+func (c *ReadOnlyConn) SetWriteDeadline(_ time.Time) error { return nil }
+
+func ReadClientHello(clientConn net.Conn, prefix []byte) (helloInfo *tls.ClientHelloInfo, rawData []byte, err error) {
+	sconn := NewSniffConn(clientConn, defaultMaxSize)
+	sconn.buf = append(sconn.buf, prefix...)
+	sconn.Rb = prefix
+
+	roc := &ReadOnlyConn{
+		r:          sconn,
+		remoteAddr: clientConn.RemoteAddr(),
+	}
+
+	var helloInfoPtr *tls.ClientHelloInfo
+
+	fakeTLS := tls.Server(roc, &tls.Config{
+		GetConfigForClient: func(hi *tls.ClientHelloInfo) (*tls.Config, error) {
+			tmp := *hi
+			helloInfoPtr = &tmp
+			return nil, nil
+		},
+	})
+	err = fakeTLS.Handshake()
+	if helloInfoPtr == nil {
+		if err == nil {
+			err = errors.New("no clientHello, but handshake returned nil error")
+		}
+		return nil, sconn.Bytes(), err
+	}
+
+	return helloInfoPtr, sconn.Bytes(), nil
+}
 
 func InitTls(customCert tls.Certificate) {
 	if len(customCert.Certificate) > 0 {
@@ -218,12 +325,6 @@ func AddTrustedCert(vkey string, fp []byte) {
 }
 
 func NewTlsServerConn(conn net.Conn) net.Conn {
-	var err error
-	if err != nil {
-		logs.Error("%v", err)
-		os.Exit(0)
-		return nil
-	}
 	config := &tls.Config{Certificates: []tls.Certificate{cert}}
 	return tls.Server(conn, config)
 }

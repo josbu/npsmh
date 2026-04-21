@@ -2,6 +2,7 @@ package rate
 
 import (
 	"encoding/json"
+	"io"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -24,6 +25,19 @@ const (
 
 type stopSignal struct {
 	ch chan struct{}
+}
+
+type Meter struct {
+	lastSampleNs int64
+	inAcc        int64
+	outAcc       int64
+	inBps        int64
+	outBps       int64
+}
+
+type rateConn struct {
+	conn io.ReadWriteCloser
+	rate Limiter
 }
 
 type Rate struct {
@@ -106,6 +120,149 @@ func NewRate(limitBps int64) *Rate {
 	atomic.StoreInt64(&r.lastSampleNs, now)
 	atomic.StoreInt64(&r.nowBps, 0)
 	return r
+}
+
+func NewMeter() *Meter {
+	now := time.Now().UnixNano()
+	return &Meter{lastSampleNs: now}
+}
+
+func (m *Meter) Clone() *Meter {
+	if m == nil {
+		return nil
+	}
+	cloned := &Meter{}
+	atomic.StoreInt64(&cloned.lastSampleNs, atomic.LoadInt64(&m.lastSampleNs))
+	atomic.StoreInt64(&cloned.inAcc, atomic.LoadInt64(&m.inAcc))
+	atomic.StoreInt64(&cloned.outAcc, atomic.LoadInt64(&m.outAcc))
+	atomic.StoreInt64(&cloned.inBps, atomic.LoadInt64(&m.inBps))
+	atomic.StoreInt64(&cloned.outBps, atomic.LoadInt64(&m.outBps))
+	return cloned
+}
+
+func (m *Meter) Add(in, out int64) {
+	if m == nil {
+		return
+	}
+	if in != 0 {
+		atomic.AddInt64(&m.inAcc, in)
+	}
+	if out != 0 {
+		atomic.AddInt64(&m.outAcc, out)
+	}
+	m.roll(time.Now().UnixNano())
+}
+
+func (m *Meter) Snapshot() (int64, int64, int64) {
+	if m == nil {
+		return 0, 0, 0
+	}
+	m.roll(time.Now().UnixNano())
+	inBps := atomic.LoadInt64(&m.inBps)
+	outBps := atomic.LoadInt64(&m.outBps)
+	return inBps, outBps, inBps + outBps
+}
+
+func (m *Meter) Reset() {
+	if m == nil {
+		return
+	}
+	now := time.Now().UnixNano()
+	atomic.StoreInt64(&m.lastSampleNs, now)
+	atomic.StoreInt64(&m.inAcc, 0)
+	atomic.StoreInt64(&m.outAcc, 0)
+	atomic.StoreInt64(&m.inBps, 0)
+	atomic.StoreInt64(&m.outBps, 0)
+}
+
+func (m *Meter) roll(nowNs int64) {
+	if m == nil {
+		return
+	}
+	last := atomic.LoadInt64(&m.lastSampleNs)
+	if nowNs <= last || nowNs-last < sampleIntervalNs {
+		return
+	}
+	if !atomic.CompareAndSwapInt64(&m.lastSampleNs, last, nowNs) {
+		return
+	}
+	delta := nowNs - last
+	if delta <= 0 {
+		return
+	}
+	inBytes := atomic.SwapInt64(&m.inAcc, 0)
+	outBytes := atomic.SwapInt64(&m.outAcc, 0)
+	atomic.StoreInt64(&m.inBps, inBytes*sampleIntervalNs/delta)
+	atomic.StoreInt64(&m.outBps, outBytes*sampleIntervalNs/delta)
+}
+
+func NewRateConn(conn io.ReadWriteCloser, rate Limiter) io.ReadWriteCloser {
+	return &rateConn{
+		conn: conn,
+		rate: rate,
+	}
+}
+
+func (s *rateConn) Read(b []byte) (n int, err error) {
+	n, err = s.conn.Read(b)
+	if s.rate != nil && n > 0 {
+		s.rate.Get(int64(n))
+	}
+	return
+}
+
+func (s *rateConn) Write(b []byte) (n int, err error) {
+	if s.rate != nil && len(b) > 0 {
+		s.rate.Get(int64(len(b)))
+	}
+	n, err = s.conn.Write(b)
+	if s.rate != nil && len(b) > 0 && n < len(b) {
+		s.rate.ReturnBucket(int64(len(b) - n))
+	}
+	return
+}
+
+func (s *rateConn) Close() error {
+	return s.conn.Close()
+}
+
+func (r *Rate) Clone() *Rate {
+	if r == nil {
+		return nil
+	}
+	enabled := atomic.LoadInt32(&r.enabled)
+	if r.t0.IsZero() {
+		cloned := NewRate(atomic.LoadInt64(&r.rate))
+		if enabled == 0 {
+			cloned.Stop()
+		}
+		return cloned
+	}
+
+	r.mu.Lock()
+	stopped := r.stopped
+	burstNs := r.burstNs
+	t0 := r.t0
+	r.mu.Unlock()
+
+	cloned := &Rate{
+		burstNs: burstNs,
+		t0:      t0,
+		stopped: stopped,
+	}
+	atomic.StoreInt64(&cloned.rate, atomic.LoadInt64(&r.rate))
+	atomic.StoreInt64(&cloned.tat, atomic.LoadInt64(&r.tat))
+	atomic.StoreInt32(&cloned.enabled, enabled)
+	atomic.StoreInt64(&cloned.bytesAcc, atomic.LoadInt64(&r.bytesAcc))
+	atomic.StoreInt64(&cloned.lastSampleNs, atomic.LoadInt64(&r.lastSampleNs))
+	atomic.StoreInt64(&cloned.nowBps, atomic.LoadInt64(&r.nowBps))
+
+	signal := &stopSignal{ch: make(chan struct{})}
+	if stopped {
+		close(signal.ch)
+	}
+	cloned.stop.Store(signal)
+	return cloned
 }
 
 func (r *Rate) SetLimit(limitBps int64) {
@@ -225,50 +382,11 @@ func (r *Rate) ReturnBucket(size int64) {
 }
 
 func (r *Rate) Get(size int64) {
-	if r == nil || size <= 0 || atomic.LoadInt32(&r.enabled) == 0 {
+	wait := r.reserve(size)
+	if wait <= coalesceWaitNs {
 		return
 	}
-
-	atomic.AddInt64(&r.bytesAcc, size)
-
-	now := r.nowNs()
-	r.updateRateWithNow(now)
-
-	rate := atomic.LoadInt64(&r.rate)
-	if rate <= 0 {
-		return
-	}
-
-	stopCh := (<-chan struct{})(nil)
-	if s := r.stop.Load(); s != nil {
-		stopCh = s.ch
-	}
-
-	cost := bytesToNsCeil(size, rate)
-
-	for {
-		minTat := now - r.burstNs
-
-		prev := atomic.LoadInt64(&r.tat)
-		base := prev
-		if base < minTat {
-			base = minTat
-		}
-		next := clampAdd(base, cost)
-
-		if atomic.CompareAndSwapInt64(&r.tat, prev, next) {
-			wait := next - now
-			if wait > coalesceWaitNs {
-				sleepNs(wait, stopCh)
-			}
-			return
-		}
-
-		if atomic.LoadInt32(&r.enabled) == 0 {
-			return
-		}
-		now = r.nowNs()
-	}
+	sleepNs(wait, r.stopCh())
 }
 
 func (r *Rate) MarshalJSON() ([]byte, error) {
@@ -296,6 +414,58 @@ func sleepNs(waitNs int64, stopCh <-chan struct{}) {
 	case <-stopCh:
 	}
 	putTimer(t)
+}
+
+func (r *Rate) reserve(size int64) int64 {
+	if r == nil || size <= 0 || atomic.LoadInt32(&r.enabled) == 0 {
+		return 0
+	}
+
+	atomic.AddInt64(&r.bytesAcc, size)
+
+	now := r.nowNs()
+	r.updateRateWithNow(now)
+
+	currentRate := atomic.LoadInt64(&r.rate)
+	if currentRate <= 0 {
+		return 0
+	}
+
+	cost := bytesToNsCeil(size, currentRate)
+
+	for {
+		minTat := now - r.burstNs
+
+		prev := atomic.LoadInt64(&r.tat)
+		base := prev
+		if base < minTat {
+			base = minTat
+		}
+		next := clampAdd(base, cost)
+
+		if atomic.CompareAndSwapInt64(&r.tat, prev, next) {
+			wait := next - now
+			if wait < 0 {
+				return 0
+			}
+			return wait
+		}
+
+		if atomic.LoadInt32(&r.enabled) == 0 {
+			return 0
+		}
+		now = r.nowNs()
+	}
+}
+
+func (r *Rate) stopCh() <-chan struct{} {
+	if r == nil {
+		return nil
+	}
+	if s := r.stop.Load(); s != nil {
+		return s.ch
+	}
+	return nil
 }
 
 func (r *Rate) updateRateWithNow(now int64) {

@@ -1,6 +1,7 @@
 package transport
 
 import (
+	"errors"
 	"net"
 	"unsafe"
 
@@ -9,21 +10,29 @@ import (
 
 const SIO_KEEPALIVE_VALS = 0x98000004
 
+var errInvalidKeepAliveParams = errors.New("tcp keepalive parameters must be positive")
+
 type tcpKeepalive struct {
 	OnOff             uint32
 	KeepAliveTime     uint32
 	KeepAliveInterval uint32
 }
 
-func SetTcpKeepAliveParams(tc *net.TCPConn, idle, intvl, _ int) error {
+func SetTcpKeepAliveParams(tc *net.TCPConn, idle, intvl, probes int) error {
+	switch {
+	case tc == nil:
+		return net.ErrClosed
+	case idle <= 0 || intvl <= 0 || probes <= 0:
+		return errInvalidKeepAliveParams
+	}
 	raw, err := tc.SyscallConn()
 	if err != nil {
 		return err
 	}
 	ka := tcpKeepalive{
 		OnOff:             1,
-		KeepAliveTime:     uint32(idle * 1000),  // 毫秒
-		KeepAliveInterval: uint32(intvl * 1000), // 毫秒
+		KeepAliveTime:     uint32(idle * 1000),
+		KeepAliveInterval: uint32(intvl * 1000),
 	}
 	var bytesReturned uint32
 	var serr error

@@ -3,10 +3,13 @@ package service
 import (
 	"math/rand"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/djylb/nps/lib/file"
 	"github.com/djylb/nps/lib/logs"
+	"github.com/djylb/nps/lib/policy"
 	"github.com/djylb/nps/lib/servercfg"
 )
 
@@ -33,6 +36,7 @@ type LoginBanRecord struct {
 
 type LoginPolicyService interface {
 	Settings() LoginPolicySettings
+	AllowsIP(ip string) bool
 	IsIPBanned(ip string) bool
 	IsUserBanned(username string) bool
 	RecordFailure(key string, explicit bool)
@@ -42,9 +46,34 @@ type LoginPolicyService interface {
 	BanList() []LoginBanRecord
 }
 
+type GlobalService interface {
+	Save(SaveGlobalInput) error
+	Get() *file.Glob
+	BanList() []LoginBanRecord
+	Unban(key string) bool
+	UnbanAll()
+	CleanBans()
+}
+
+type DefaultGlobalService struct {
+	LoginPolicy LoginPolicyService
+	Repo        GlobalRepository
+	Backend     Backend
+}
+
+type SaveGlobalInput struct {
+	EntryACLMode  int
+	EntryACLRules string
+}
+
 type DefaultLoginPolicy struct {
 	ConfigProvider func() *servercfg.Snapshot
 	records        sync.Map
+	staticMu       sync.RWMutex
+	staticSource   *policy.SourceIPPolicy
+	staticMode     int
+	staticRules    string
+	staticGeoIP    string
 }
 
 var sharedLoginPolicy = NewDefaultLoginPolicy(servercfg.Current)
@@ -63,6 +92,51 @@ func SharedLoginPolicy() *DefaultLoginPolicy {
 	return sharedLoginPolicy
 }
 
+func (s DefaultGlobalService) Save(input SaveGlobalInput) error {
+	entryACLMode, entryACLRules := normalizeEntryACLInput(input.EntryACLMode, input.EntryACLRules)
+	return s.repo().SaveGlobal(&file.Glob{
+		EntryAclMode:  entryACLMode,
+		EntryAclRules: entryACLRules,
+	})
+}
+
+func (s DefaultGlobalService) Get() *file.Glob {
+	return s.repo().GetGlobal()
+}
+
+func (s DefaultGlobalService) BanList() []LoginBanRecord {
+	return s.loginPolicy().BanList()
+}
+
+func (s DefaultGlobalService) Unban(key string) bool {
+	return s.loginPolicy().RemoveBan(key)
+}
+
+func (s DefaultGlobalService) UnbanAll() {
+	s.loginPolicy().RemoveAllBans()
+}
+
+func (s DefaultGlobalService) CleanBans() {
+	s.loginPolicy().Clean(true)
+}
+
+func (s DefaultGlobalService) loginPolicy() LoginPolicyService {
+	if !isNilServiceValue(s.LoginPolicy) {
+		return s.LoginPolicy
+	}
+	return SharedLoginPolicy()
+}
+
+func (s DefaultGlobalService) repo() GlobalRepository {
+	if !isNilServiceValue(s.Repo) {
+		return s.Repo
+	}
+	if !isNilServiceValue(s.Backend.Repository) {
+		return s.Backend.Repository
+	}
+	return DefaultBackend().Repository
+}
+
 func (s *DefaultLoginPolicy) Settings() LoginPolicySettings {
 	cfg := s.config()
 	return LoginPolicySettings{
@@ -73,6 +147,14 @@ func (s *DefaultLoginPolicy) Settings() LoginPolicySettings {
 		MaxLoginBody: cfg.Security.LoginMaxBody,
 		MaxSkew:      cfg.Security.LoginMaxSkew,
 	}
+}
+
+func (s *DefaultLoginPolicy) AllowsIP(ip string) bool {
+	ip = strings.TrimSpace(ip)
+	if ip == "" {
+		return true
+	}
+	return s.sourcePolicy().AllowsAddr(ip)
 }
 
 func (s *DefaultLoginPolicy) IsIPBanned(ip string) bool {
@@ -88,9 +170,9 @@ func (s *DefaultLoginPolicy) RecordFailure(key string, explicit bool) {
 		return
 	}
 	now := time.Now()
-	value, loaded := s.records.LoadOrStore(key, &loginFailureRecord{hasLoginFailTimes: 1, lastLoginTime: now})
+	value, loaded := s.loadOrStoreRecord(key, &loginFailureRecord{hasLoginFailTimes: 1, lastLoginTime: now})
 	if loaded {
-		current := value.(*loginFailureRecord)
+		current := value
 		current.mu.Lock()
 		current.lastLoginTime = now
 		current.hasLoginFailTimes++
@@ -124,8 +206,16 @@ func (s *DefaultLoginPolicy) Clean(force bool) {
 	settings := s.Settings()
 	now := time.Now()
 	s.records.Range(func(key, value interface{}) bool {
-		currentKey := key.(string)
-		current := value.(*loginFailureRecord)
+		currentKey, ok := key.(string)
+		if !ok {
+			s.removeRecordEntryIfCurrent(key, value)
+			return true
+		}
+		current, ok := value.(*loginFailureRecord)
+		if !ok || current == nil {
+			s.removeRecordEntryIfCurrent(currentKey, value)
+			return true
+		}
 
 		ttl := settings.UserBanTime
 		if net.ParseIP(currentKey) != nil {
@@ -149,8 +239,16 @@ func (s *DefaultLoginPolicy) BanList() []LoginBanRecord {
 	now := time.Now()
 
 	s.records.Range(func(key, value interface{}) bool {
-		currentKey := key.(string)
-		current := value.(*loginFailureRecord)
+		currentKey, ok := key.(string)
+		if !ok {
+			s.removeRecordEntryIfCurrent(key, value)
+			return true
+		}
+		current, ok := value.(*loginFailureRecord)
+		if !ok || current == nil {
+			s.removeRecordEntryIfCurrent(currentKey, value)
+			return true
+		}
 
 		banType := "username"
 		ttl := settings.UserBanTime
@@ -183,8 +281,7 @@ func (s *DefaultLoginPolicy) isBanned(key string, ttl int64) bool {
 		return false
 	}
 	settings := s.Settings()
-	if value, ok := s.records.Load(key); ok {
-		current := value.(*loginFailureRecord)
+	if current, ok := s.loadRecord(key); ok {
 		current.mu.Lock()
 		defer current.mu.Unlock()
 
@@ -204,15 +301,117 @@ func (s *DefaultLoginPolicy) isBanned(key string, ttl int64) bool {
 	return false
 }
 
+func (s *DefaultLoginPolicy) loadRecord(key string) (*loginFailureRecord, bool) {
+	if s == nil || key == "" {
+		return nil, false
+	}
+	value, ok := s.records.Load(key)
+	if !ok {
+		return nil, false
+	}
+	current, ok := value.(*loginFailureRecord)
+	if !ok || current == nil {
+		s.removeRecordEntryIfCurrent(key, value)
+		return nil, false
+	}
+	return current, true
+}
+
+func (s *DefaultLoginPolicy) loadOrStoreRecord(key string, candidate *loginFailureRecord) (*loginFailureRecord, bool) {
+	if s == nil || key == "" || candidate == nil {
+		return nil, false
+	}
+	for {
+		value, loaded := s.records.LoadOrStore(key, candidate)
+		if !loaded {
+			return candidate, false
+		}
+		current, ok := value.(*loginFailureRecord)
+		if ok && current != nil {
+			return current, true
+		}
+		s.removeRecordEntryIfCurrent(key, value)
+	}
+}
+
+func (s *DefaultLoginPolicy) removeRecordEntryIfCurrent(key, value interface{}) bool {
+	if s == nil || key == nil || value == nil {
+		return false
+	}
+	return s.records.CompareAndDelete(key, value)
+}
+
 func (s *DefaultLoginPolicy) IsBannedForTTL(key string, ttl int64) bool {
 	return s.isBanned(key, ttl)
 }
 
 func (s *DefaultLoginPolicy) config() *servercfg.Snapshot {
-	if s != nil && s.ConfigProvider != nil {
-		if cfg := s.ConfigProvider(); cfg != nil {
-			return cfg
+	if s == nil {
+		return servercfg.Current()
+	}
+	return servercfg.ResolveProvider(s.ConfigProvider)
+}
+
+func (s *DefaultLoginPolicy) sourcePolicy() *policy.SourceIPPolicy {
+	cfg := s.config()
+	mode := 0
+	rules := ""
+	geoIPPath := ""
+	if cfg != nil {
+		mode = cfg.Security.LoginACLMode
+		rules = cfg.Security.LoginACLRules
+		geoIPPath = cfg.App.GeoIPPath
+	}
+	s.staticMu.RLock()
+	if s.staticSource != nil && s.staticMode == mode && s.staticRules == rules && s.staticGeoIP == geoIPPath {
+		compiled := s.staticSource
+		s.staticMu.RUnlock()
+		return compiled
+	}
+	s.staticMu.RUnlock()
+
+	compiled := compileLoginSourcePolicy(cfg)
+
+	s.staticMu.Lock()
+	s.staticSource = compiled
+	s.staticMode = mode
+	s.staticRules = rules
+	s.staticGeoIP = geoIPPath
+	s.staticMu.Unlock()
+	return compiled
+}
+
+func compileLoginSourcePolicy(cfg *servercfg.Snapshot) *policy.SourceIPPolicy {
+	if cfg == nil {
+		return policy.CompileSourceIPPolicy(policy.ModeOff, nil, policy.Options{})
+	}
+	return policy.CompileSourceIPPolicy(
+		policy.NormalizeMode(cfg.Security.LoginACLMode),
+		splitLoginACLRules(cfg.Security.LoginACLRules),
+		policy.Options{GeoIPPath: cfg.App.GeoIPPath},
+	)
+}
+
+func splitLoginACLRules(raw string) []string {
+	raw = strings.TrimSpace(strings.ReplaceAll(raw, "\r\n", "\n"))
+	if raw == "" {
+		return nil
+	}
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == '\n' || r == ','
+	})
+	if len(fields) == 0 {
+		return nil
+	}
+	entries := make([]string, 0, len(fields))
+	for _, field := range fields {
+		field = strings.TrimSpace(field)
+		if field != "" {
+			entries = append(entries, field)
 		}
 	}
-	return servercfg.Current()
+	if len(entries) == 0 {
+		return nil
+	}
+	return entries
 }

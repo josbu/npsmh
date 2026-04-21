@@ -2,12 +2,15 @@ package common
 
 import (
 	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
+	"time"
 )
 
 // ReadAllFromFile Read file content by file path
@@ -39,8 +42,11 @@ func GetCertContent(filePath, header string) (string, error) {
 		filePath = filepath.Join(GetRunPath(), filePath)
 	}
 	content, err := ReadAllFromFile(filePath)
-	if err != nil || !strings.Contains(string(content), header) {
+	if err != nil {
 		return "", err
+	}
+	if !strings.Contains(string(content), header) {
+		return "", fmt.Errorf("content at %s does not contain %s", filePath, header)
 	}
 	return string(content), nil
 }
@@ -75,6 +81,60 @@ func LoadCert(certFile, keyFile string) (tls.Certificate, bool) {
 	return tls.Certificate{}, false
 }
 
+func LoadCertLeaf(certFile, keyFile string) (*x509.Certificate, error) {
+	certificate, ok := LoadCert(certFile, keyFile)
+	if !ok {
+		return nil, errors.New("invalid certificate pair")
+	}
+	if len(certificate.Certificate) == 0 {
+		return nil, errors.New("empty certificate")
+	}
+	leaf, err := x509.ParseCertificate(certificate.Certificate[0])
+	if err != nil {
+		return nil, err
+	}
+	return leaf, nil
+}
+
+func LoadCertExpireAt(certFile, keyFile string) (time.Time, error) {
+	leaf, err := LoadCertLeaf(certFile, keyFile)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return leaf.NotAfter, nil
+}
+
+func LoadCertDomains(certFile, keyFile string) ([]string, error) {
+	leaf, err := LoadCertLeaf(certFile, keyFile)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{})
+	add := func(value string, domains *[]string) {
+		value = strings.TrimSpace(strings.ToLower(value))
+		if value == "" {
+			return
+		}
+		if _, ok := seen[value]; ok {
+			return
+		}
+		seen[value] = struct{}{}
+		*domains = append(*domains, value)
+	}
+
+	domains := make([]string, 0, len(leaf.DNSNames)+len(leaf.IPAddresses)+1)
+	for _, name := range leaf.DNSNames {
+		add(name, &domains)
+	}
+	for _, ip := range leaf.IPAddresses {
+		add(ip.String(), &domains)
+	}
+	if len(leaf.DNSNames) == 0 && len(leaf.IPAddresses) == 0 {
+		add(leaf.Subject.CommonName, &domains)
+	}
+	return domains, nil
+}
+
 func GetCertType(s string) string {
 	if s == "" {
 		return "empty"
@@ -97,10 +157,13 @@ func FileExists(name string) bool {
 }
 
 func GetExtFromPath(path string) string {
-	s := strings.Split(path, ".")
-	re, err := regexp.Compile(`(\w+)`)
-	if err != nil {
+	base := filepath.Base(strings.TrimSpace(path))
+	if base == "" {
 		return ""
 	}
-	return string(re.Find([]byte(s[0])))
+	ext := filepath.Ext(base)
+	if ext == "" || ext == base {
+		return ""
+	}
+	return strings.TrimPrefix(ext, ".")
 }
